@@ -2,6 +2,18 @@
 
 Every push adds a dated entry below. The newest entry is at the top.
 
+## 2026-10-22: Releases page and beta notice
+
+**What:** the first GitHub release, `v0.2.0-beta`, with `DailyHelper.rbxm` and `DailyHelper.rbxmx` as
+direct downloads.
+
+**Where:** `README.md` (download links to the latest release, a beta notice, update steps) and this
+file. The release itself is on the Releases page.
+
+**Why:** visitors can download the plugin in one click, with no need to open the `dist/` folder. The
+beta notice tells them that the plugin gets regular updates and that each update comes as a new
+release. The links use `releases/latest`, so they always point to the newest version.
+
 ## 2026-10-22: v0.2.0, first public push
 
 **What:** the first release of Daily Helper, a Roblox Studio plugin that audits the open place.

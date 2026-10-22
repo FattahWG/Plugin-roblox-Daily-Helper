@@ -9,6 +9,14 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/FattahWG/Plugin-roblox-Daily-Helper/releases/latest"><b>Download the latest release</b></a>
+  ·
+  <a href="CHANGELOG.md">Changelog</a>
+  ·
+  <a href="docs/CHECKS.md">All rules</a>
+</p>
+
+<p align="center">
   <img src="docs/images/start-screen.png" width="300" alt="Start screen with the liquid blob">
   <img src="docs/images/fix-preview.png" width="300" alt="A finding with its before and after lines">
 </p>
@@ -17,8 +25,11 @@ Daily Helper scans the open place in a few seconds. It finds old API names, comm
 code, UI traps and heavy parts of the map. For each finding, it explains the problem in plain words.
 When a safe fix exists, it shows the exact change and asks before it applies it.
 
-> **Status: beta (v0.2.0).** The scan only reads your place. The automatic script fixes are new. Read
-> the before and after lines of each fix before you press Apply.
+> **Beta (v0.2.0).** Daily Helper is in beta and gets regular updates. Each update has a release with
+> notes on the [Releases](https://github.com/FattahWG/Plugin-roblox-Daily-Helper/releases) page. The scan
+> only reads your place. The automatic script fixes are new, so read the before and after lines of each
+> fix before you press Apply. Found a false alarm or a bug? Open an
+> [issue](https://github.com/FattahWG/Plugin-roblox-Daily-Helper/issues).
 
 ## Contents
 
@@ -55,8 +66,10 @@ plugin itself needs no update for this.
 
 ## Install
 
-1. Download [`dist/DailyHelper.rbxm`](dist/DailyHelper.rbxm). The XML copy
-   [`dist/DailyHelper.rbxmx`](dist/DailyHelper.rbxmx) is the same plugin.
+1. Download **[DailyHelper.rbxm](https://github.com/FattahWG/Plugin-roblox-Daily-Helper/releases/latest/download/DailyHelper.rbxm)**
+   from the latest release. The XML copy
+   [DailyHelper.rbxmx](https://github.com/FattahWG/Plugin-roblox-Daily-Helper/releases/latest/download/DailyHelper.rbxmx)
+   is the same plugin. The [`dist/`](dist/) folder holds the same files.
 2. Put the file in your local Plugins folder:
    - Windows: `%LOCALAPPDATA%\Roblox\Plugins`
    - macOS: `~/Documents/Roblox/Plugins`
@@ -64,6 +77,9 @@ plugin itself needs no update for this.
 4. On the **Plugins** tab, click **Daily Helper**.
 
 You can also open the folder from Studio: **Plugins** tab, then **Plugins Folder**.
+
+**Update:** download the new release and replace the old file in the Plugins folder, then restart
+Studio. Your settings, text size and logs stay.
 
 ## Use
 
