@@ -1,0 +1,3348 @@
+<roblox version="4"><Item class="Script" referent="RBX19"><Properties><string name="Name">DailyHelper</string><ProtectedString name="Source"><![CDATA[-- Daily Helper: a Studio plugin for daily maintenance. It audits the open place and asks before it changes anything.
+
+local RunService = game:GetService("RunService")
+
+-- Plugins also load inside a playtest. The audit is for edit mode only.
+if RunService:IsRunning() then
+	return
+end
+
+local App = require(script.App)
+
+-- The icon: a yellow calendar page with a check mark. Decal 101925756110390 in the group Lawak
+-- Gamehouse, distributed on the Creator Store so every place can load it.
+local ICON = "rbxassetid://120596024740650"
+
+local toolbar = plugin:CreateToolbar("Daily Helper")
+local toggle = toolbar:CreateButton("Daily Helper", "Daily check-up for this place", ICON)
+toggle.ClickableWhenViewportHidden = true
+
+local widget = plugin:CreateDockWidgetPluginGui(
+	"DailyHelper",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 380, 720, 320, 420)
+)
+widget.Title = "Daily Helper"
+widget.Name = "DailyHelper"
+
+local app = App.start(plugin, widget)
+
+toggle:SetActive(widget.Enabled)
+toggle.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	toggle:SetActive(widget.Enabled)
+end)
+
+plugin.Unloading:Connect(app.stop)
+]]></ProtectedString></Properties><Item class="ModuleScript" referent="RBX1"><Properties><string name="Name">ApiDump</string><ProtectedString name="Source"><![CDATA[-- Reads the deprecated members and classes from the Roblox API dump of the current Studio build.
+-- The full dump is large, so the plugin keeps only a small list in its settings and downloads
+-- the dump again only when Roblox ships a new Studio version.
+
+local HttpService = game:GetService("HttpService")
+
+local ApiDump = {}
+
+local VERSION_URL = "https://setup.rbxcdn.com/versionQTStudio"
+local DUMP_URL = "https://setup.rbxcdn.com/%s-Full-API-Dump.json"
+local CACHE_KEY = "ApiCache"
+local CACHE_FORMAT = 1
+
+export type Data = {
+	format: number,
+	version: string,
+	-- Member names that are deprecated on every class that has them.
+	members: { [string]: string },
+	-- Case-only renames, for example clone -> Clone.
+	renames: { [string]: string },
+	classes: { [string]: boolean },
+}
+
+local function hasTag(item, tag: string): boolean
+	for _, value in item.Tags or {} do
+		if value == tag then
+			return true
+		end
+	end
+	return false
+end
+
+local function build(dump, version: string): Data
+	local deprecated, live = {}, {}
+	local classes = {}
+	for _, class in dump.Classes do
+		if hasTag(class, "Deprecated") then
+			classes[class.Name] = true
+		end
+		for _, member in class.Members do
+			if hasTag(member, "Deprecated") then
+				deprecated[member.Name] = deprecated[member.Name] or class.Name
+			else
+				live[member.Name] = true
+			end
+		end
+	end
+	local members, renames = {}, {}
+	for name, className in deprecated do
+		if not live[name] then
+			members[name] = className
+			local upper = string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2)
+			if upper ~= name and live[upper] then
+				renames[name] = upper
+			end
+		end
+	end
+	return { format = CACHE_FORMAT, version = version, members = members, renames = renames, classes = classes }
+end
+
+-- Returns data, status ("live", "cached" or "offline") and a message for the log.
+function ApiDump.load(plugin: Plugin): (Data?, string, string)
+	local cached = plugin:GetSetting(CACHE_KEY)
+	if type(cached) ~= "table" or cached.format ~= CACHE_FORMAT then
+		cached = nil
+	end
+
+	local ok, version = pcall(HttpService.GetAsync, HttpService, VERSION_URL)
+	if not ok or type(version) ~= "string" or not string.match(version, "^version%-%x+$") then
+		if cached then
+			return cached, "cached", "API dump " .. cached.version .. " read from the cache (offline)"
+		end
+		return nil, "offline", "The API dump did not load. Allow HTTP for setup.rbxcdn.com and run again."
+	end
+
+	if cached and cached.version == version then
+		-- The cache matches today's Studio build, thus it is as good as a new download.
+		return cached, "live", "API dump " .. version .. " read from the cache (current)"
+	end
+
+	local fetched, body = pcall(HttpService.GetAsync, HttpService, string.format(DUMP_URL, version))
+	if not fetched then
+		if cached then
+			return cached, "cached", "API dump download failed. The old cache " .. cached.version .. " is used."
+		end
+		return nil, "offline", "The API dump download failed: " .. tostring(body)
+	end
+	local decoded, dump = pcall(HttpService.JSONDecode, HttpService, body)
+	if not decoded or type(dump) ~= "table" or type(dump.Classes) ~= "table" then
+		return cached, if cached then "cached" else "offline", "The API dump has an unknown format."
+	end
+	local data = build(dump, version)
+	plugin:SetSetting(CACHE_KEY, data)
+	local count = 0
+	for _ in data.members do
+		count += 1
+	end
+	return data, "live", string.format("API dump %s downloaded: %d deprecated members", version, count)
+end
+
+return ApiDump
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX2"><Properties><string name="Name">App</string><ProtectedString name="Source"><![CDATA[-- The plugin state and actions. init.server.luau starts it with the real plugin and dock window,
+-- and a test can start it with a stand-in plugin and a ScreenGui.
+
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local Selection = game:GetService("Selection")
+
+local ApiDump = require(script.Parent.ApiDump)
+local Edit = require(script.Parent.Edit)
+local Log = require(script.Parent.Log)
+local Scanner = require(script.Parent.Scanner)
+local View = require(script.Parent.View)
+
+local App = {}
+
+App.VERSION = "0.2.0"
+
+-- plugin: needs GetSetting, SetSetting and OpenScript. widget: a DockWidgetPluginGui or a ScreenGui.
+function App.start(plugin, widget)
+	local log = Log.new(plugin)
+	local statsKey = "Stats_" .. string.sub(log.key, 5)
+
+	local enabled = plugin:GetSetting("Enabled")
+	if type(enabled) ~= "table" then
+		enabled = {}
+		for _, check in Scanner.Checks do
+			enabled[check.id] = true
+		end
+	end
+
+	local studioVersion = string.match(version(), "^(%d+%.%d+)") or version()
+
+	local app = {
+		log = log,
+		checks = Scanner.Checks,
+		apiVersion = nil,
+		versionText = string.format("v%s  ·  Studio %s", App.VERSION, studioVersion),
+		state = {
+			-- "intro" (start screen), "info" (Information) or "main" (the tabs).
+			screen = "intro",
+			infoFrom = "intro",
+			tab = "Scan",
+			scope = "place",
+			enabled = enabled,
+			running = false,
+			progress = "",
+			findings = {},
+			stats = plugin:GetSetting(statsKey),
+			filter = "All",
+			apiStatus = "unknown",
+			overlay = nil,
+			picked = {},
+			scale = 1.25,
+			query = "",
+		},
+		actions = {},
+	}
+	local state, actions = app.state, app.actions
+	local savedScale = plugin:GetSetting("UiScale")
+	if type(savedScale) == "number" and savedScale >= 1 and savedScale <= 2 then
+		state.scale = savedScale
+	end
+	local cache = plugin:GetSetting("ApiCache")
+	app.apiVersion = if type(cache) == "table" and type(cache.version) == "string" then cache.version else nil
+	local view
+
+	local function render()
+		if view then
+			view:render()
+		end
+	end
+
+	-- The findings with a fix that the developer has not decided on yet.
+	function app.pendingFixes()
+		local result = {}
+		for _, finding in state.findings do
+			if finding.fix and (finding.status == nil or finding.status == "Failed") then
+				table.insert(result, finding)
+			end
+		end
+		return result
+	end
+
+	local function short(finding): string
+		return string.format("%s  ·  %s", if finding.fix then finding.fix.label else finding.title, finding.path)
+	end
+
+	-- ===== actions =====
+
+	function actions.setScale(scale: number)
+		state.scale = scale
+		plugin:SetSetting("UiScale", scale)
+		view:applyScale()
+		render()
+	end
+
+	function actions.start()
+		state.screen = "main"
+		render()
+	end
+
+	function actions.showInfo()
+		if state.screen ~= "info" then
+			state.infoFrom = state.screen
+		end
+		state.screen = "info"
+		render()
+	end
+
+	function actions.back()
+		state.screen = if state.infoFrom == "main" then "main" else "intro"
+		render()
+	end
+
+	function actions.setTab(name: string)
+		state.tab = name
+		render()
+	end
+
+	function actions.setScope(scope: string)
+		state.scope = scope
+		render()
+	end
+
+	function actions.toggleCheck(id: string)
+		state.enabled[id] = not state.enabled[id]
+		plugin:SetSetting("Enabled", state.enabled)
+		render()
+	end
+
+	function actions.setFilter(filter: string)
+		state.filter = filter
+		if view then
+			view.shown = 40
+		end
+		render()
+	end
+
+	function actions.run()
+		if state.running then
+			return
+		end
+		local roots = if state.scope == "selection" then Selection:Get() else Scanner.placeRoots()
+		if #roots == 0 then
+			log:add("failed", "Nothing is selected. Select an object, or choose Whole place.")
+			state.tab = "Log"
+			render()
+			return
+		end
+		local count = 0
+		for _, on in state.enabled do
+			if on then
+				count += 1
+			end
+		end
+		if count == 0 then
+			log:add("failed", "No check is on. Turn on a check first.")
+			state.tab = "Log"
+			render()
+			return
+		end
+
+		state.running = true
+		state.progress = "Starting..."
+		render()
+		log:add("info", string.format("Audit started  ·  %s  ·  %d checks",
+			if state.scope == "selection" then "selection" else "whole place", count))
+
+		task.spawn(function()
+			local api, apiMessage = nil, nil
+			if state.enabled.api then
+				if view then
+					view:setProgress("Reading the Roblox API...")
+				end
+				local status
+				api, status, apiMessage = ApiDump.load(plugin)
+				state.apiStatus = status
+				if api then
+					app.apiVersion = api.version
+				end
+				log:add(if api then "info" else "failed", apiMessage)
+			end
+			local ok, findings, stats = pcall(Scanner.run, {
+				roots = roots,
+				enabled = state.enabled,
+				api = api,
+				apiMessage = apiMessage,
+				progress = function(text)
+					state.progress = text
+					if view then
+						view:setProgress(text)
+					end
+				end,
+			})
+			state.running = false
+			if not ok then
+				log:add("failed", "The audit stopped: " .. tostring(findings))
+				state.tab = "Log"
+				render()
+				return
+			end
+			state.findings = findings
+			state.stats = stats
+			state.filter = "All"
+			state.picked = {}
+			if view then
+				view.shown = 40
+			end
+			plugin:SetSetting(statsKey, stats)
+			log:add("done", string.format("Audit done  ·  %d scripts  ·  %d findings  ·  score %d",
+				stats.scripts, #findings, stats.score))
+			state.tab = "Findings"
+			-- Ask the developer at once. A risky change starts unticked.
+			local pending = app.pendingFixes()
+			for _, finding in pending do
+				state.picked[finding] = not finding.fix.risky
+			end
+			state.overlay = if #pending > 0 then "prompt" else nil
+			render()
+		end)
+	end
+
+	function actions.open(finding)
+		local target = finding.target
+		if typeof(target) == "Instance" and target:IsA("LuaSourceContainer") then
+			task.spawn(function()
+				local options = nil
+				if finding.line then
+					options = { HighlightRange = { Start = { Line = finding.line, Character = 1 }, End = { Line = finding.line, Character = 1 } } }
+				end
+				local ok, err = ScriptEditorService:OpenScriptDocumentAsync(target, options)
+				if not ok then
+					plugin:OpenScript(target, finding.line or 1)
+					if err then
+						warn("[Daily Helper] " .. tostring(err))
+					end
+				end
+			end)
+			return
+		end
+		local items = if typeof(target) == "Instance" then { target } else target
+		local alive = {}
+		for _, item in items or {} do
+			if item.Parent then
+				table.insert(alive, item)
+			end
+		end
+		Selection:Set(alive)
+	end
+
+	local function applyOne(finding): boolean
+		-- Keep each script's text first. Restore puts it back if the developer does not like the change.
+		local before = {}
+		for _, item in finding.fix.scripts or {} do
+			table.insert(before, { script = item, original = Edit.readSource(item) })
+		end
+		local ok, err = Edit.record(finding.fix.label, finding.fix.apply)
+		if ok then
+			for _, saved in before do
+				saved.written = Edit.readSource(saved.script)
+			end
+			finding.snapshots = if #before > 0 then before else nil
+			finding.status = "Applied"
+			finding.note = nil
+			log:add("applied", "Applied  ·  " .. short(finding))
+		else
+			finding.status = "Failed"
+			finding.note = tostring(err or "The change did not apply.")
+			log:add("failed", "Failed  ·  " .. short(finding) .. "  ·  " .. finding.note)
+		end
+		return ok
+	end
+
+	function actions.apply(finding)
+		task.spawn(function()
+			applyOne(finding)
+			render()
+		end)
+	end
+
+	function actions.skip(finding)
+		finding.status = "Skipped"
+		log:add("skipped", "Skipped  ·  " .. short(finding))
+		render()
+	end
+
+	function actions.restore(finding)
+		local snapshots = finding.snapshots
+		if not snapshots then
+			return
+		end
+		task.spawn(function()
+			local restored, failed = 0, nil
+			for _, saved in snapshots do
+				local ok, err = Edit.restore(saved.script, saved.original, saved.written)
+				if ok then
+					restored += 1
+				else
+					failed = err
+				end
+			end
+			if failed then
+				finding.note = "Restore stopped: the script changed after Apply. Nothing was overwritten in that script."
+				log:add("failed", "Restore stopped  ·  " .. short(finding))
+			else
+				finding.status = "Restored"
+				finding.snapshots = nil
+				finding.note = nil
+				log:add("undo", string.format("Restored  ·  %s  ·  %d %s", short(finding), restored, if restored == 1 then "script" else "scripts"))
+			end
+			render()
+		end)
+	end
+
+	function actions.setQuery(text: string)
+		state.query = text
+		if view then
+			view.shown = 40
+		end
+		render()
+	end
+
+	function actions.review(finding)
+		finding.status = "Reviewed"
+		log:add("reviewed", "Reviewed  ·  " .. short(finding))
+		render()
+	end
+
+	function actions.openPrompt()
+		state.picked = {}
+		for _, finding in app.pendingFixes() do
+			state.picked[finding] = not finding.fix.risky
+		end
+		state.overlay = "prompt"
+		render()
+	end
+
+	function actions.togglePick(finding)
+		state.picked[finding] = not state.picked[finding]
+		render()
+	end
+
+	function actions.applyPicked()
+		local chosen, left = {}, {}
+		for _, finding in app.pendingFixes() do
+			if state.picked[finding] then
+				table.insert(chosen, finding)
+			else
+				table.insert(left, finding)
+			end
+		end
+		state.overlay = nil
+		render()
+		task.spawn(function()
+			local applied = 0
+			for _, finding in chosen do
+				if applyOne(finding) then
+					applied += 1
+				end
+			end
+			for _, finding in left do
+				log:add("skipped", "Not applied  ·  " .. short(finding) .. "  ·  developer choice")
+			end
+			log:add("done", string.format("Applied %d of %d chosen changes", applied, #chosen))
+			render()
+		end)
+	end
+
+	function actions.closeOverlay()
+		if state.overlay == "prompt" then
+			log:add("info", "Apply prompt closed  ·  no change made")
+		end
+		state.overlay = nil
+		render()
+	end
+
+	function actions.openCopy()
+		state.overlay = "copy"
+		render()
+	end
+
+	function actions.clearLog()
+		log:clear()
+		render()
+	end
+
+	view = View.new(widget, app)
+
+	local connections = {}
+	table.insert(connections, log.changed.Event:Connect(function()
+		if state.tab == "Log" and not state.running then
+			render()
+		end
+	end))
+	table.insert(connections, ChangeHistoryService.OnUndo:Connect(function(waypoint)
+		local name = string.match(waypoint, "^Daily Helper: (.+)$")
+		if name then
+			log:add("undo", "Undo  ·  " .. name)
+		end
+	end))
+	table.insert(connections, ChangeHistoryService.OnRedo:Connect(function(waypoint)
+		local name = string.match(waypoint, "^Daily Helper: (.+)$")
+		if name then
+			log:add("redo", "Redo  ·  " .. name)
+		end
+	end))
+	-- Each time the developer turns the window on, it opens on the start screen. A closed window
+	-- stops the blob animation.
+	table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if widget.Enabled then
+			if not state.running then
+				state.screen = "intro"
+				state.overlay = nil
+			end
+			render()
+		else
+			view:stopBlob()
+		end
+	end))
+	table.insert(connections, settings().Studio.ThemeChanged:Connect(function()
+		view:build()
+	end))
+
+	function app.stop()
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		view:stopBlob()
+		log.changed:Destroy()
+		if view.root then
+			view.root:Destroy()
+		end
+	end
+
+	app.view = view
+	return app
+end
+
+return App
+]]></ProtectedString></Properties></Item><Item class="Folder" referent="RBX3"><Properties><string name="Name">Checks</string></Properties><Item class="ModuleScript" referent="RBX4"><Properties><string name="Name">DataTypes</string><ProtectedString name="Source"><![CDATA[-- Old datatype members (CFrame, Vector3, Vector2, Color3). Studio's Script Analysis marks them in
+-- orange, but the API dump lists classes only, so these come from a fixed list. Roblox renamed them
+-- years ago and keeps the old names working, so the list does not change.
+-- The plugin cannot know the type of a value, so each rule also tests the text before the dot.
+
+local Edit = require(script.Parent.Parent.Edit)
+local Util = require(script.Parent.Util)
+
+local DataTypes = {}
+
+-- Text before ".p" or ".lookVector" that names a CFrame.
+local CFRAME_BEFORE = {
+	"[Cc][Ff][Rr][Aa][Mm][Ee]%s*$", -- part.CFrame, cframe, myCFrame
+	"CoordinateFrame%s*$",
+	"Focus%s*$",
+	"%f[%w_][Cc][Ff]%d*%s*$", -- cf, CF, cf2
+	"GetPivot%(%)%s*$",
+	"[Cc][01]%s*$", -- weld.C0, weld.C1
+}
+
+local PROPERTIES = {
+	p = { new = "Position", cframe = true },
+	lookVector = { new = "LookVector", cframe = true },
+	rightVector = { new = "RightVector", cframe = true },
+	upVector = { new = "UpVector", cframe = true },
+	unit = { new = "Unit" },
+	magnitude = { new = "Magnitude" },
+}
+
+local METHODS = {
+	inverse = "Inverse", lerp = "Lerp", toWorldSpace = "ToWorldSpace", toObjectSpace = "ToObjectSpace",
+	pointToWorldSpace = "PointToWorldSpace", pointToObjectSpace = "PointToObjectSpace",
+	vectorToWorldSpace = "VectorToWorldSpace", vectorToObjectSpace = "VectorToObjectSpace",
+	components = "GetComponents", toEulerAnglesXYZ = "ToEulerAnglesXYZ", toAxisAngle = "ToAxisAngle",
+}
+
+local function namesCFrame(before: string): boolean
+	for _, pattern in CFRAME_BEFORE do
+		if string.find(before, pattern) then
+			return true
+		end
+	end
+	return false
+end
+
+-- The number of top-level commas inside the brackets that open at `open`, or nil when the
+-- closing bracket is on another line.
+local function topLevelCommas(line: string, open: number): number?
+	local depth, commas = 0, 0
+	for index = open, #line do
+		local char = string.sub(line, index, index)
+		if char == "(" or char == "{" or char == "[" then
+			depth += 1
+		elseif char == ")" or char == "}" or char == "]" then
+			depth -= 1
+			if depth == 0 then
+				return commas
+			end
+		elseif char == "," and depth == 1 then
+			commas += 1
+		end
+	end
+	return nil
+end
+
+-- Field names that some script assigns: "config.unit = ...". Datatype properties are read-only,
+-- so an assigned name belongs to a game table.
+local function assignedFields(ctx): { [string]: boolean }
+	if ctx.assignedFields then
+		return ctx.assignedFields
+	end
+	local names = {}
+	for _, entry in ctx.scripts do
+		for name in string.gmatch(entry.code, "%.([%a_][%w_]*)%s*=[^=]") do
+			names[name] = true
+		end
+	end
+	ctx.assignedFields = names
+	return names
+end
+
+-- Adds one finding per old name per script.
+function DataTypes.run(ctx, entry)
+	local own = Util.ownNames(ctx)
+	local assigned = assignedFields(ctx)
+	local groups, order = {}, {}
+	local function add(key, title, text, label, spot)
+		if not groups[key] then
+			groups[key] = { title = title, text = text, label = label, spots = {} }
+			table.insert(order, key)
+		end
+		table.insert(groups[key].spots, spot)
+	end
+
+	for lineNumber, line in entry.codeLines do
+		-- Properties: ".name" that is not a call.
+		for column, name in string.gmatch(line, "()%.([%a_][%w_]*)") do
+			local rule = PROPERTIES[name]
+			local after = string.sub(line, column + 1 + #name)
+			if rule and string.sub(line, column - 1, column - 1) ~= "." and not string.find(after, "^%s*%(") then
+				local before = string.sub(line, 1, column - 1)
+				local ok = if rule.cframe then namesCFrame(before) else not (own[name] or assigned[name])
+				if ok then
+					add("." .. name, "Deprecated: ." .. name,
+						string.format(".%s is the old name. Use .%s. It gives the same value.", name, rule.new),
+						string.format(".%s → .%s", name, rule.new), { lineNumber, column + 1, name, rule.new })
+				end
+			end
+		end
+		-- Methods: ":name(".
+		for column, name in string.gmatch(line, "():([%a_][%w_]*)%s*%(") do
+			local new = METHODS[name]
+			if new and not own[name] then
+				add(":" .. name, "Deprecated: :" .. name .. "()",
+					string.format(":%s() is the old name. Use :%s(). It does the same.", name, new),
+					string.format(":%s() → :%s()", name, new), { lineNumber, column + 1, name, new })
+			end
+		end
+		-- CFrame.new(position, lookAt) with two values is CFrame.lookAt.
+		for column in string.gmatch(line, "()%f[%w_]CFrame%.new%s*%(") do
+			local open = string.find(line, "(", column, true) :: number
+			if topLevelCommas(line, open) == 1 then
+				add("CFrame.new2", "Deprecated: CFrame.new(pos, lookAt)",
+					"CFrame.new with two positions is the old form. CFrame.lookAt takes the same two values.",
+					"CFrame.new(a, b) → CFrame.lookAt(a, b)", { lineNumber, column + 7, "new", "lookAt" })
+			end
+		end
+	end
+
+	for _, key in order do
+		local group = groups[key]
+		local spots = group.spots
+		local first = spots[1][1]
+		local where = Util.where(entry.script, first)
+		if #spots > 1 then
+			where ..= string.format("  (+%d more)", #spots - 1)
+		end
+		local label = group.label
+		ctx.add({
+			severity = "Warning",
+			tag = "SCRIPTS",
+			title = group.title,
+			path = where,
+			target = entry.script,
+			line = first,
+			text = group.text,
+			fix = Edit.scriptFix(entry.script, label .. (if #spots > 1 then string.format(" (%d lines)", #spots) else ""),
+				Edit.computeReplaceMany(spots)),
+		})
+	end
+end
+
+return DataTypes
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX5"><Properties><string name="Name">DeclareOrder</string><ProtectedString name="Source"><![CDATA[-- A name used before its top-level `local` line. Above that line, Luau reads a global of the same
+-- name, which is nil. The classic case: a function near the top calls a helper whose `local` is
+-- further down, and the call fails only when that function runs.
+-- The fix is a forward declaration: `local Name` above the first use, and the later
+-- `local Name = value` becomes `Name = value`.
+
+local Edit = require(script.Parent.Parent.Edit)
+local Util = require(script.Parent.Util)
+
+local DeclareOrder = {}
+
+-- Built-in names. A script can shadow them on purpose (local workspace = game.Workspace).
+local BUILT_IN = {}
+for _, name in {
+	"game", "workspace", "script", "plugin", "shared", "_G", "Instance", "Vector3", "Vector2", "CFrame", "Color3",
+	"UDim", "UDim2", "Enum", "Ray", "Region3", "Rect", "TweenInfo", "BrickColor", "NumberRange", "NumberSequence",
+	"ColorSequence", "PhysicalProperties", "Random", "DateTime", "RaycastParams", "OverlapParams", "Font", "Axes",
+	"Faces", "Content", "SharedTable", "task", "math", "string", "table", "os", "debug", "coroutine", "utf8",
+	"bit32", "buffer", "vector", "print", "warn", "error", "require", "type", "typeof", "pairs", "ipairs", "next",
+	"select", "tostring", "tonumber", "unpack", "pcall", "xpcall", "assert", "setmetatable", "getmetatable",
+	"rawget", "rawset", "rawequal", "rawlen", "tick", "time", "wait", "delay", "spawn", "settings", "UserSettings",
+	"version", "stats", "elapsedTime", "gcinfo", "newproxy", "collectgarbage",
+} do
+	BUILT_IN[name] = true
+end
+
+local KEYWORD_STARTS = { ["end"] = true, ["else"] = true, ["elseif"] = true, ["until"] = true }
+
+-- The first line of the top-level statement that holds `lineNumber`: the nearest line above that
+-- starts at column 1 with a word that does not close a block.
+local function statementStart(lines: { string }, lineNumber: number): number
+	for index = lineNumber, 1, -1 do
+		local word = string.match(lines[index], "^([%a_][%w_]*)")
+		if word and not KEYWORD_STARTS[word] then
+			return index
+		end
+	end
+	return 1
+end
+
+-- Lines inside a type declaration. Types have their own names in Luau, so `export type Icon = ...`
+-- above `local Icon = {}` is not a use of the variable.
+local function typeLines(lines: { string }): { [number]: boolean }
+	local inside = {}
+	local depth, open = 0, false
+	for lineNumber, line in lines do
+		if not open and (string.find(line, "^%s*export%s+type%s") or string.find(line, "^%s*type%s+[%a_]")) then
+			open = true
+			depth = 0
+		end
+		if open then
+			inside[lineNumber] = true
+			for char in string.gmatch(line, "[{}()]") do
+				depth += if char == "{" or char == "(" then 1 else -1
+			end
+			-- The declaration goes on while a bracket is open or the line ends in "=", "|", "&" or "->".
+			if depth <= 0 and not string.find(line, "[=|&]%s*$") and not string.find(line, "%->%s*$") then
+				open = false
+			end
+		end
+	end
+	return inside
+end
+
+function DeclareOrder.run(ctx, entry)
+	local lines = entry.codeLines
+	local typeLine = typeLines(lines)
+
+	-- 1. Top-level declarations (column 1), the first one of each name.
+	local declared = {}
+	for lineNumber, line in lines do
+		local fn = string.match(line, "^local%s+function%s+([%a_][%w_]*)")
+		if fn then
+			declared[fn] = declared[fn] or { line = lineNumber, kind = "function" }
+		else
+			local list, rest = string.match(line, "^local%s+([%a_][%w_%s,]*)(.*)$")
+			if list then
+				local names = {}
+				for name in string.gmatch(list, "[%a_][%w_]*") do
+					table.insert(names, name)
+				end
+				local kind = if #names > 1 then "multi"
+					elseif string.find(rest, "^:") or string.find(rest, "^<") then "typed"
+					elseif string.find(rest, "^=") then "value"
+					elseif string.find(rest, "^%s*$") then "bare"
+					else "other"
+				for _, name in names do
+					declared[name] = declared[name] or { line = lineNumber, kind = kind }
+				end
+			end
+		end
+	end
+
+	-- 2. Names that also have an inner declaration somewhere: a local, a parameter or a loop variable.
+	-- The use may be that inner one, so these are skipped to stay safe.
+	local shadowed = {}
+	for lineNumber, line in lines do
+		for list in string.gmatch(line, "%f[%w_]local%s+([%a_][%w_%s,]*)") do
+			for name in string.gmatch(list, "[%a_][%w_]*") do
+				local decl = declared[name]
+				if decl and decl.line ~= lineNumber then
+					shadowed[name] = true
+				end
+			end
+		end
+		for params in string.gmatch(line, "%f[%w_]function[^(]*%(([^)]*)%)") do
+			for name in string.gmatch(params, "[%a_][%w_]*") do
+				shadowed[name] = true
+			end
+		end
+		for list in string.gmatch(line, "%f[%w_]for%s+([%a_][%w_%s,]*)") do
+			for name in string.gmatch(list, "[%a_][%w_]*") do
+				shadowed[name] = true
+			end
+		end
+	end
+
+	-- 3. The first use of each declared name above its declaration.
+	local firstUse = {}
+	for lineNumber, line in lines do
+		for column, name in string.gmatch(line, "()([%a_][%w_]*)") do
+			local decl = declared[name]
+			if decl and lineNumber < decl.line and not firstUse[name] and not shadowed[name] and not BUILT_IN[name]
+				and not typeLine[lineNumber] then
+				local before = Util.charBefore(line, column)
+				-- A type after "->" (and after ":" or "::", which isField covers) is not the variable.
+				local isType = string.find(string.sub(line, 1, column - 1), "%->%s*$") ~= nil
+				local after = string.sub(line, column + #name)
+				-- "a.name", "a:name" and a table key "{ name = 1 }" are not the variable.
+				local isField = before == "." or before == ":"
+				local isKey = string.find(after, "^%s*=[^=]") and (before == "{" or before == "," or before == ";"
+					or (before == "" and string.find(line, ",%s*$")))
+				if not isField and not isKey and not isType and string.sub(line, column - 1, column - 1) ~= "." then
+					firstUse[name] = lineNumber
+				end
+			end
+		end
+	end
+
+	for name, useLine in firstUse do
+		local decl = declared[name]
+		local finding = {
+			severity = "Error",
+			tag = "SCRIPTS",
+			title = "Used before its local line: " .. name,
+			path = Util.where(entry.script, useLine),
+			target = entry.script,
+			line = useLine,
+			text = string.format("Line %d uses %s, but local %s is on line %d. Above that line, Luau reads a global %s, "
+				.. "which is nil. Declare it above its first use.", useLine, name, name, decl.line, name),
+		}
+		local declLine = lines[decl.line]
+		local insertAfter = statementStart(lines, useLine) - 1
+		local compute = nil
+		if decl.kind == "function" then
+			local old = string.match(declLine, "^local%s+function%s+" .. name .. "%f[^%w_]")
+			compute = Edit.chain({
+				Edit.computeReplaceMany({ { decl.line, 1, old, "function " .. name } }),
+				Edit.computeInsertLineAfter(insertAfter, nil, "local " .. name),
+			})
+		elseif decl.kind == "value" or decl.kind == "bare" then
+			local old = string.match(declLine, "^local%s+" .. name .. "%f[^%w_]")
+			-- "local Name" with no value becomes an empty line.
+			compute = Edit.chain({
+				Edit.computeReplaceMany({ { decl.line, 1, old, if decl.kind == "value" then name else "" } }),
+				Edit.computeInsertLineAfter(insertAfter, nil, "local " .. name),
+			})
+		end
+		if compute then
+			finding.fix = Edit.scriptFix(entry.script, string.format("Declare %s above line %d", name, useLine), compute, true)
+		else
+			finding.text ..= " This declaration has several names or a type, so move it by hand."
+		end
+		ctx.add(finding)
+	end
+end
+
+return DeclareOrder
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX6"><Properties><string name="Name">LiveApi</string><ProtectedString name="Source"><![CDATA[-- Live API: members and classes that the API dump of today's Studio build marks deprecated.
+
+local Edit = require(script.Parent.Parent.Edit)
+local Util = require(script.Parent.Util)
+
+local Check = {
+	id = "api",
+	name = "Live API",
+	desc = "Deprecated members from today's API dump",
+}
+
+-- RBXScriptSignal and RBXScriptConnection are data types, thus the dump does not list them.
+local SIGNAL_RENAMES = { connect = "Connect", disconnect = "Disconnect" }
+
+-- Lower-case names are common in game code. Only these classic Roblox names count.
+local LOWER_NAMES = {
+	connect = true, disconnect = true, findFirstChild = true, getChildren = true, isA = true,
+	isDescendantOf = true, className = true, userId = true, localPlayer = true, children = true,
+}
+
+local MAX_GROUPS = 200
+
+function Check.run(ctx)
+	local api = ctx.api
+	if not api then
+		ctx.add({
+			severity = "Info",
+			title = "Live API check skipped",
+			path = "Plugin settings",
+			text = ctx.apiMessage or "The API dump did not load.",
+		})
+		return
+	end
+
+	local own = Util.ownNames(ctx)
+	local groups = 0
+	for index, entry in ctx.scripts do
+		local found = {}
+		local order = {}
+		Util.eachMatch(entry.codeLines, "()([%.:])%s*([%a_][%w_]*)", function(lineNumber, column, accessor, name)
+			local line = entry.codeLines[lineNumber]
+			-- ".." joins strings, and "a .. Velocity" is not a member.
+			if string.sub(line, column - 1, column - 1) == "." or own[name] then
+				return
+			end
+			-- Enum.KeyCode.Insert is an enum item, not a member.
+			if string.find(string.sub(line, 1, column - 1), "Enum%s*%.%s*[%w_]+%s*$") then
+				return
+			end
+			local className = api.members[name]
+			local rename = api.renames[name]
+			if not className and accessor == ":" and SIGNAL_RENAMES[name] then
+				className, rename = "RBXScriptSignal", SIGNAL_RENAMES[name]
+			end
+			if not className or (not string.find(name, "%u") and not LOWER_NAMES[name]) then
+				return
+			end
+			-- A definition line names the game's own function.
+			if string.find(line, "^%s*function") or string.find(line, "^%s*local%s+function") then
+				return
+			end
+			local key = accessor .. name
+			if not found[key] then
+				found[key] = { accessor = accessor, name = name, className = className, rename = rename, spots = {} }
+				table.insert(order, key)
+			end
+			local nameColumn = string.find(line, name, column, true)
+			table.insert(found[key].spots, { lineNumber, nameColumn, name, rename or name })
+		end)
+
+		for _, key in order do
+			if groups >= MAX_GROUPS then
+				break
+			end
+			groups += 1
+			local group = found[key]
+			local spots = group.spots
+			local first = spots[1][1]
+			local where = Util.where(entry.script, first)
+			if #spots > 1 then
+				where ..= string.format("  (+%d more)", #spots - 1)
+			end
+			local finding = {
+				severity = "Warning",
+				title = string.format("Deprecated: %s%s", group.accessor, group.name),
+				path = where,
+				target = entry.script,
+				line = first,
+				text = string.format("%s.%s is deprecated in the API of Studio %s. Read its page in the "
+					.. "Roblox docs for the replacement.", group.className, group.name, api.version),
+			}
+			if group.rename then
+				finding.text = string.format("%s.%s is deprecated. Use %s%s. It does the same.",
+					group.className, group.name, group.accessor, group.rename)
+				finding.fix = Edit.scriptFix(entry.script, string.format("%s%s → %s%s%s", group.accessor, group.name, group.accessor, group.rename,
+					if #spots > 1 then string.format(" (%d lines)", #spots) else ""), Edit.computeReplaceMany(spots))
+			end
+			ctx.add(finding)
+		end
+
+		Util.eachMatch(entry.stringLines, "()Instance%.new%(%s*[\"']([%w_]+)[\"']", function(lineNumber, _, className)
+			if api.classes[className] then
+				ctx.add({
+					severity = "Warning",
+					title = "Deprecated class: " .. className,
+					path = Util.where(entry.script, lineNumber),
+					target = entry.script,
+					line = lineNumber,
+					text = className .. " is deprecated in the API of Studio " .. api.version
+						.. ". New features do not support it.",
+				})
+			end
+		end)
+		if index % 25 == 0 then
+			ctx.yield()
+		end
+	end
+
+	local byClass = {}
+	for _, item in ctx.instances do
+		if api.classes[item.ClassName] then
+			byClass[item.ClassName] = byClass[item.ClassName] or {}
+			table.insert(byClass[item.ClassName], item)
+		end
+	end
+	for className, items in byClass do
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#items, className .. " object") .. " (deprecated class)",
+			path = "Press Select to see them",
+			target = items,
+			text = className .. " is deprecated in the API of Studio " .. api.version
+				.. ". It still works, but replace it when you next change that part of the game.",
+		})
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX7"><Properties><string name="Name">Performance</string><ProtectedString name="Source"><![CDATA[-- Performance: the big costs that a place tree shows before a playtest.
+
+local Workspace = game:GetService("Workspace")
+
+local Util = require(script.Parent.Util)
+
+local Check = {
+	id = "performance",
+	name = "Performance",
+	desc = "Parts, physics, lights, particles, sounds",
+}
+
+local LIMITS = {
+	parts = 25000,
+	looseAssemblies = 150,
+	shadowLights = 8,
+	particleRate = 200,
+	loopingSounds = 12,
+}
+
+local function cap(list: { Instance }, size: number): { Instance }
+	local result = table.create(math.min(#list, size))
+	for i = 1, math.min(#list, size) do
+		result[i] = list[i]
+	end
+	return result
+end
+
+function Check.run(ctx)
+	local parts, loose, lights, particles, sounds, precise = 0, {}, {}, {}, {}, {}
+	local seenRoots = {}
+	for index, item in ctx.instances do
+		if item:IsA("BasePart") then
+			if item:IsDescendantOf(Workspace) then
+				parts += 1
+				local root = item.AssemblyRootPart
+				if root and not root.Anchored and not seenRoots[root] then
+					seenRoots[root] = true
+					local model = root:FindFirstAncestorWhichIsA("Model")
+					if not (model and model:FindFirstChildOfClass("Humanoid")) then
+						table.insert(loose, root)
+					end
+				end
+			end
+			if item:IsA("PartOperation") and item.CollisionFidelity == Enum.CollisionFidelity.PreciseConvexDecomposition then
+				table.insert(precise, item)
+			end
+		elseif item:IsA("Light") then
+			if item.Enabled and item.Shadows then
+				table.insert(lights, item)
+			end
+		elseif item:IsA("ParticleEmitter") then
+			if item.Enabled and item.Rate > LIMITS.particleRate then
+				table.insert(particles, item)
+			end
+		elseif item:IsA("Sound") then
+			if item.Playing and item.Looped then
+				table.insert(sounds, item)
+			end
+		end
+		if index % 2000 == 0 then
+			ctx.yield()
+		end
+	end
+
+	if parts > LIMITS.parts then
+		ctx.add({
+			severity = "Warning",
+			title = string.format("%d parts in Workspace", parts),
+			path = "Workspace",
+			target = Workspace,
+			text = "Phones slow down with many parts. Merge small detail parts into meshes, and turn on "
+				.. "StreamingEnabled for a large map.",
+		})
+	end
+	if #loose > LIMITS.looseAssemblies then
+		ctx.add({
+			severity = "Warning",
+			title = Util.plural(#loose, "unanchored assembly", "unanchored assemblies"),
+			path = "Press Select to see them",
+			target = cap(loose, 500),
+			text = "Each one runs physics all the time. Anchor the parts that never move.",
+		})
+	end
+	if #lights > LIMITS.shadowLights then
+		ctx.add({
+			severity = "Warning",
+			title = Util.plural(#lights, "light casts", "lights cast") .. " shadows",
+			path = "Press Select to see them",
+			target = lights,
+			text = "Each shadow light costs a lot on phones. Keep shadows only on the lights that the player sees most.",
+			fix = {
+				label = "Shadows off on " .. Util.plural(#lights, "light"),
+				risky = true,
+				apply = function()
+					for _, light in lights do
+						light.Shadows = false
+					end
+					return true
+				end,
+			},
+		})
+	end
+	if #particles > 0 then
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#particles, "emitter") .. " above " .. LIMITS.particleRate .. " per second",
+			path = "Press Select to see them",
+			target = particles,
+			text = "A high Rate fills the screen with particles on a weak device. Lower the Rate and use "
+				.. "bigger particles for the same look.",
+		})
+	end
+	if #sounds > LIMITS.loopingSounds then
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#sounds, "looping sound") .. " play at start",
+			path = "Press Select to see them",
+			target = sounds,
+			text = "Many looping sounds play at the same time. Start a sound only near its place.",
+		})
+	end
+	if #precise > 0 then
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#precise, "union") .. " with precise collision",
+			path = "Press Select to see them",
+			target = cap(precise, 500),
+			text = "PreciseConvexDecomposition costs the most physics. Use Box or Hull for a union that a "
+				.. "player does not touch closely.",
+		})
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX8"><Properties><string name="Name">Scripts</string><ProtectedString name="Source"><![CDATA[-- Scripts: names used before their local line, deprecated globals and datatype members, and more
+-- than one ProcessReceipt.
+
+local Edit = require(script.Parent.Parent.Edit)
+local Util = require(script.Parent.Util)
+local DataTypes = require(script.Parent.DataTypes)
+local DeclareOrder = require(script.Parent.DeclareOrder)
+
+local Check = {
+	id = "scripts",
+	name = "Scripts",
+	desc = "Declare order, deprecated globals and CFrame names",
+}
+
+local GLOBALS = {
+	wait = { new = "task.wait", text = "Use task.wait(). It runs on the task scheduler and does not throttle." },
+	delay = { new = "task.delay", text = "Use task.delay(). The old delay() waits for the next throttled step." },
+	spawn = {
+		new = "task.spawn",
+		risky = true,
+		text = "Use task.spawn() or task.defer(). task.spawn runs the function at once, and spawn() "
+			.. "waited a frame first. Check the order of your code.",
+	},
+}
+
+function Check.run(ctx)
+	local receipts = {}
+	for index, entry in ctx.scripts do
+		local code = entry.code
+		for name, info in GLOBALS do
+			if string.find(code, "%f[%w_]" .. name .. "%s*%(") then
+				-- A script that defines its own function of that name is fine.
+				local own = string.find(code, "local%s+" .. name .. "%f[^%w_]")
+					or string.find(code, "local%s+function%s+" .. name .. "%f[^%w_]")
+					or string.find(code, "%f[%w_]function%s+" .. name .. "%f[^%w_]")
+				if not own then
+					local spots = {}
+					Util.eachMatch(entry.codeLines, "()%f[%w_]" .. name .. "%s*%(", function(lineNumber, column)
+						local before = Util.charBefore(entry.codeLines[lineNumber], column)
+						if before ~= "." and before ~= ":" then
+							table.insert(spots, { lineNumber, column, name, info.new })
+						end
+					end)
+					if #spots > 0 then
+						local first = spots[1][1]
+						local where = Util.where(entry.script, first)
+						if #spots > 1 then
+							where ..= string.format("  (+%d more)", #spots - 1)
+						end
+						ctx.add({
+							severity = "Warning",
+							tag = "SCRIPTS",
+							title = "Deprecated global: " .. name .. "()",
+							path = where,
+							target = entry.script,
+							line = first,
+							text = info.text,
+							fix = Edit.scriptFix(entry.script, name .. "() → " .. info.new .. "()"
+								.. (if #spots > 1 then string.format(" (%d lines)", #spots) else ""),
+								Edit.computeReplaceMany(spots), info.risky),
+						})
+					end
+				end
+			end
+		end
+		DeclareOrder.run(ctx, entry)
+		DataTypes.run(ctx, entry)
+		if string.find(code, "ProcessReceipt%s*=") then
+			table.insert(receipts, entry.script)
+		end
+		if index % 25 == 0 then
+			ctx.yield()
+		end
+	end
+
+	if #receipts > 1 then
+		local names = {}
+		for _, item in receipts do
+			table.insert(names, item.Name)
+		end
+		ctx.add({
+			severity = "Error",
+			title = Util.plural(#receipts, "script sets", "scripts set") .. " ProcessReceipt",
+			path = table.concat(names, ", "),
+			target = receipts,
+			text = "MarketplaceService keeps only the last ProcessReceipt. Purchases that the other scripts "
+				.. "handle are lost. Keep one ProcessReceipt and route each product from it.",
+		})
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX9"><Properties><string name="Name">Security</string><ProtectedString name="Source"><![CDATA[-- Security: code that loads other code, hides what it does, or sends data out.
+-- The plugin never changes these scripts. The developer reads them and decides.
+
+local Util = require(script.Parent.Util)
+
+local Check = {
+	id = "security",
+	name = "Security",
+	desc = "Hidden require by id, getfenv, loadstring",
+}
+
+local RULES = {
+	{
+		pattern = "()%f[%w_]require%s*%(%s*[%d]",
+		severity = "Error",
+		title = "Hidden require by asset id",
+		text = "The script loads a module from the web by its id. Free-model backdoors use this. "
+			.. "Read the module before you keep it.",
+	},
+	{
+		pattern = "()%f[%w_]require%s*%(%s*tonumber",
+		severity = "Error",
+		title = "Require with a computed id",
+		text = "The script builds a module id at run time to hide it. Remove the script unless you wrote it.",
+	},
+	{
+		pattern = "()%f[%w_][gs]etfenv%s*%(",
+		severity = "Warning",
+		title = "getfenv or setfenv",
+		text = "These change the environment of other code and turn off Luau optimizations. "
+			.. "Backdoors use them to hide calls.",
+	},
+	{
+		pattern = "()%f[%w_]loadstring%s*%(",
+		severity = "Warning",
+		title = "loadstring",
+		text = "The script runs text as code. Make sure that the text never comes from a player or the web.",
+	},
+}
+
+function Check.run(ctx)
+	for index, entry in ctx.scripts do
+		for _, rule in RULES do
+			Util.eachMatch(entry.codeLines, rule.pattern, function(lineNumber)
+				ctx.add({
+					severity = rule.severity,
+					title = rule.title,
+					path = Util.where(entry.script, lineNumber),
+					target = entry.script,
+					line = lineNumber,
+					text = rule.text,
+				})
+			end)
+		end
+
+		-- Escaped text like "\104\116\116\112" hides words from a search.
+		local _, escapes = string.gsub(entry.strings, "\\%d%d?%d?", "")
+		if escapes >= 40 then
+			ctx.add({
+				severity = "Warning",
+				title = "Obfuscated text",
+				path = Util.where(entry.script),
+				target = entry.script,
+				line = 1,
+				text = string.format("The script holds %d escaped characters. Hidden text often hides a "
+					.. "module id or a web address.", escapes),
+			})
+		end
+
+		Util.eachMatch(entry.stringLines, "()discord[app]*%.com/api/webhooks", function(lineNumber)
+			ctx.add({
+				severity = "Warning",
+				title = "Discord webhook address",
+				path = Util.where(entry.script, lineNumber),
+				target = entry.script,
+				line = lineNumber,
+				text = "The script sends data to a Discord webhook. A webhook address in a game leaks, "
+					.. "and free models use it to send out data.",
+			})
+		end)
+
+		if index % 25 == 0 then
+			ctx.yield()
+		end
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX10"><Properties><string name="Name">Tree</string><ProtectedString name="Source"><![CDATA[-- Place tree: same-name siblings and empty folders. A second item with the same name hides
+-- from FindFirstChild and WaitForChild, and the bug shows only at run time.
+
+local Util = require(script.Parent.Util)
+
+local Check = {
+	id = "tree",
+	name = "Place tree",
+	desc = "Same-name siblings, empty folders",
+}
+
+-- Classes that scripts look up by name. Parts and models often share names on purpose.
+local LOOKUP_CLASSES = {
+	"Folder", "Configuration", "LuaSourceContainer", "RemoteEvent", "RemoteFunction",
+	"UnreliableRemoteEvent", "BindableEvent", "BindableFunction", "ValueBase", "LayerCollector",
+}
+
+local function isLookup(item: Instance): boolean
+	for _, className in LOOKUP_CLASSES do
+		if item:IsA(className) then
+			return true
+		end
+	end
+	return false
+end
+
+local function isEmptyFolder(item: Instance): boolean
+	return item.ClassName == "Folder" and #item:GetChildren() == 0 and next(item:GetAttributes()) == nil
+		and #item:GetTags() == 0
+end
+
+local function remove(items: { Instance })
+	for _, item in items do
+		item.Parent = nil
+	end
+	return true
+end
+
+-- True when some script names this folder in its code or in a string ("Data", .Data,
+-- :WaitForChild("Data")). Then the folder can be a target that a script fills or waits for.
+local function usedByScripts(ctx, name: string): Instance?
+	for _, entry in ctx.scripts do
+		if string.find(entry.strings, name, 1, true) then
+			local plain = string.gsub(name, "%W", "%%%0")
+			if string.find(entry.strings, "%f[%w_]" .. plain .. "%f[^%w_]") then
+				return entry.script
+			end
+		end
+	end
+	return nil
+end
+
+function Check.run(ctx)
+	local seenParents = {}
+	local empty = {}
+	for index, item in ctx.instances do
+		if isEmptyFolder(item) then
+			table.insert(empty, item)
+		end
+		local parent = item.Parent
+		if parent and not seenParents[parent] and isLookup(item) then
+			seenParents[parent] = true
+			local byName = {}
+			for _, child in parent:GetChildren() do
+				if isLookup(child) then
+					byName[child.Name] = byName[child.Name] or {}
+					table.insert(byName[child.Name], child)
+				end
+			end
+			for name, group in byName do
+				if #group > 1 then
+					-- The first one wins a lookup. Empty folder copies after it can go.
+					local extras = {}
+					-- A name that scripts use stays: the script can wait for the copy.
+					if not usedByScripts(ctx, name) then
+						for i = 2, #group do
+							if isEmptyFolder(group[i]) then
+								table.insert(extras, group[i])
+							end
+						end
+					end
+					local finding = {
+						severity = "Warning",
+						title = string.format("%d items named \"%s\"", #group, name),
+						path = Util.path(parent),
+						target = group,
+						text = "FindFirstChild and WaitForChild return only one of them, and a script can "
+							.. "get the wrong one. Rename or merge them.",
+					}
+					if #extras > 0 then
+						finding.fix = {
+							label = "Remove " .. Util.plural(#extras, "empty copy", "empty copies"),
+							apply = function()
+								return remove(extras)
+							end,
+						}
+					end
+					ctx.add(finding)
+				end
+			end
+		end
+		if index % 2000 == 0 then
+			ctx.yield()
+		end
+	end
+
+	-- Keep the folders that a script names. Only the others can go.
+	local unused, used = {}, 0
+	for _, folder in empty do
+		if usedByScripts(ctx, folder.Name) then
+			used += 1
+		else
+			table.insert(unused, folder)
+		end
+	end
+	empty = unused
+	if used > 0 then
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(used, "empty folder is", "empty folders are") .. " named in scripts",
+			path = "Kept, not offered for removal",
+			text = "A script names these folders, so a script can fill them or wait for them at run time. "
+				.. "Daily Helper does not offer to remove them.",
+		})
+	end
+	if #empty > 0 then
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#empty, "empty folder"),
+			path = "Press Select to see them",
+			target = empty,
+			text = "Empty folders with no attributes and no tags, and no script names them. A script can still "
+				.. "reach a folder by its path in other ways, so check before you remove them.",
+			fix = {
+				label = "Remove " .. Util.plural(#empty, "empty folder"),
+				risky = true,
+				apply = function()
+					return remove(empty)
+				end,
+			},
+		})
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX11"><Properties><string name="Name">UiLayout</string><ProtectedString name="Source"><![CDATA[-- UI and layout: draw order, text limits, fixed pixel windows, usernames on screen.
+
+local Edit = require(script.Parent.Parent.Edit)
+local Util = require(script.Parent.Util)
+
+local Check = {
+	id = "ui",
+	name = "UI and layout",
+	desc = "ZIndex, fixed pixels, text limits, DisplayName",
+}
+
+local NEW_SCREEN_GUI = "^(%s*)local%s+([%a_][%w_]*)%s*=%s*Instance%.new%(%s*[\"']ScreenGui[\"']%s*%)%s*;?%s*$"
+
+function Check.run(ctx)
+	-- 1. ScreenGuis in the tree that draw in Global order.
+	for _, item in ctx.instances do
+		if item:IsA("ScreenGui") and item.ZIndexBehavior == Enum.ZIndexBehavior.Global then
+			ctx.add({
+				severity = "Warning",
+				title = "ScreenGui uses Global ZIndex",
+				path = Util.path(item),
+				target = item,
+				text = "Set ZIndexBehavior to Sibling. Then a child always draws above its parent, "
+					.. "and a ZIndex counts only among siblings.",
+				fix = {
+					label = "ZIndexBehavior → Sibling",
+					apply = function()
+						item.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+						return true
+					end,
+				},
+			})
+		end
+	end
+	ctx.yield()
+
+	-- 2. Scripts that make a ScreenGui and never set its ZIndexBehavior. A new ScreenGui is Global.
+	for _, entry in ctx.scripts do
+		if string.find(entry.strings, "Instance%.new%(%s*[\"']ScreenGui[\"']") and not string.find(entry.code, "ZIndexBehavior", 1, true) then
+			for lineNumber, line in entry.stringLines do
+				if string.find(line, "Instance%.new%(%s*[\"']ScreenGui[\"']") then
+					local indent, name = string.match(line, NEW_SCREEN_GUI)
+					local finding = {
+						severity = "Warning",
+						title = "New ScreenGui with Global ZIndex",
+						path = Util.where(entry.script, lineNumber),
+						target = entry.script,
+						line = lineNumber,
+						text = "Instance.new(\"ScreenGui\") starts as Global. A copied window can then draw "
+							.. "over its own rows. Set ZIndexBehavior to Sibling after you make it.",
+					}
+					if name then
+						finding.fix = Edit.scriptFix(entry.script, name .. ".ZIndexBehavior = Sibling",
+							Edit.computeInsertLineAfter(lineNumber, "Instance%.new",
+								indent .. name .. ".ZIndexBehavior = Enum.ZIndexBehavior.Sibling"))
+					end
+					ctx.add(finding)
+				end
+			end
+		end
+	end
+	ctx.yield()
+
+	-- 3. Scaled text with no size limit, in one finding for the whole scope.
+	local scaled, guis = {}, {}
+	for _, item in ctx.instances do
+		if (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) and item.TextScaled
+			and not item:FindFirstChildOfClass("UITextSizeConstraint") then
+			table.insert(scaled, item)
+			local gui = item:FindFirstAncestorWhichIsA("LayerCollector")
+			if gui then
+				guis[gui] = true
+			end
+		end
+	end
+	if #scaled > 0 then
+		local guiCount = 0
+		for _ in guis do
+			guiCount += 1
+		end
+		ctx.add({
+			severity = "Info",
+			title = Util.plural(#scaled, "scaled text has", "scaled texts have") .. " no size limit",
+			path = "In " .. Util.plural(guiCount, "GUI") .. ". Press Select to see them",
+			target = scaled,
+			text = "TextScaled with no UITextSizeConstraint grows very big on a large screen. "
+				.. "Add a constraint with a MaxTextSize that fits your design.",
+		})
+	end
+	ctx.yield()
+
+	-- 4. Big windows with a fixed pixel size and no UIScale.
+	for _, item in ctx.instances do
+		if item:IsA("ScreenGui") and not item:FindFirstChildWhichIsA("UIScale", true) then
+			for _, child in item:GetChildren() do
+				if child:IsA("GuiObject") and child.Size.X.Scale == 0 and child.Size.Y.Scale == 0
+					and child.Size.X.Offset >= 300 and child.Size.Y.Offset >= 300 then
+					ctx.add({
+						severity = "Info",
+						title = "Window has a fixed pixel size",
+						path = Util.path(child),
+						target = child,
+						text = string.format("%d x %d pixels is huge on a small phone and small on a big screen. "
+							.. "Use Scale sizes, or add a UIScale that reads the screen size.",
+							child.Size.X.Offset, child.Size.Y.Offset),
+					})
+				end
+			end
+		end
+	end
+	ctx.yield()
+
+	-- 5. A username shown in a text. Players see their DisplayName everywhere else.
+	for _, entry in ctx.scripts do
+		for lineNumber, line in entry.codeLines do
+			if string.find(line, "Text%s*=") then
+				for _, pattern in { "[Pp]layer%.Name%f[^%w_]", "[Pp]lr%.Name%f[^%w_]" } do
+					local at = string.find(line, pattern)
+					if at then
+						local column = string.find(line, ".Name", at, true)
+						ctx.add({
+							severity = "Info",
+							title = "Username shown in a text",
+							path = Util.where(entry.script, lineNumber),
+							target = entry.script,
+							line = lineNumber,
+							text = "Players know each other by DisplayName. Show player.DisplayName, and keep "
+								.. "Name or UserId only as a key.",
+							fix = Edit.scriptFix(entry.script, ".Name → .DisplayName",
+								Edit.computeReplaceMany({ { lineNumber, column, ".Name", ".DisplayName" } }), true),
+						})
+						break
+					end
+				end
+			end
+		end
+	end
+end
+
+return Check
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX12"><Properties><string name="Name">Util</string><ProtectedString name="Source"><![CDATA[-- Shared helpers for the checks.
+
+local Util = {}
+
+-- Calls fn(lineNumber, column, ...captures) for each match of `pattern` in each line.
+-- The pattern must start with a position capture "()".
+function Util.eachMatch(lines: { string }, pattern: string, fn: (number, number, ...string) -> ())
+	for lineNumber, line in lines do
+		local from = 1
+		while true do
+			local results = { string.find(line, pattern, from) }
+			if not results[1] then
+				break
+			end
+			fn(lineNumber, results[3], table.unpack(results, 4))
+			from = results[2] + 1
+		end
+	end
+end
+
+-- The character before a column, spaces skipped.
+function Util.charBefore(line: string, column: number): string
+	local before = string.match(string.sub(line, 1, column - 1), "(%S)%s*$")
+	return before or ""
+end
+
+function Util.path(instance: Instance): string
+	local ok, name = pcall(instance.GetFullName, instance)
+	return if ok then name else instance.Name
+end
+
+-- A short path for a script line: "Parent.Script : 12".
+function Util.where(script: Instance, line: number?): string
+	local name = Util.path(script)
+	return if line then name .. " : " .. line else name
+end
+
+function Util.plural(count: number, one: string, many: string?): string
+	return string.format("%d %s", count, if count == 1 then one else (many or one .. "s"))
+end
+
+-- Names that the game code defines itself: methods, module functions, self fields and table keys.
+-- A deprecated Roblox name that the game also defines is most likely the game's own.
+function Util.ownNames(ctx): { [string]: boolean }
+	if ctx.ownNames then
+		return ctx.ownNames
+	end
+	local scripts = ctx.scripts
+	local names = {}
+	local patterns = {
+		"function%s+[%w_%.:]-[%.:]([%a_][%w_]*)%s*%(",
+		"[%.:]([%a_][%w_]*)%s*=%s*function",
+		"self%.([%a_][%w_]*)%s*=[^=]",
+		"[{,;]%s*([%a_][%w_]*)%s*=[^=]",
+	}
+	for _, entry in scripts do
+		for _, pattern in patterns do
+			for name in string.gmatch(entry.code, pattern) do
+				names[name] = true
+			end
+		end
+		for _, line in entry.codeLines do
+			local name = string.match(line, "^%s*([%a_][%w_]*)%s*=[^=]")
+			if name then
+				names[name] = true
+			end
+		end
+	end
+	ctx.ownNames = names
+	return names
+end
+
+return Util
+]]></ProtectedString></Properties></Item></Item><Item class="ModuleScript" referent="RBX13"><Properties><string name="Name">Edit</string><ProtectedString name="Source"><![CDATA[-- Safe script and property edits for the Apply button. A script fix is a `compute(source)` function
+-- that returns the new source, or nil when the text is no longer the text the audit found. The same
+-- function makes the before/after preview and the real edit, so the preview shows what Apply does.
+
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+
+local Edit = {}
+
+local MAX_SHIFT = 5
+local PREVIEW_LINES = 6
+
+-- Returns the first and the last index of a line, without its newline.
+local function lineSpan(source: string, lineNumber: number): (number?, number?)
+	if lineNumber < 1 then
+		return nil, nil
+	end
+	local start = 1
+	for _ = 2, lineNumber do
+		local newline = string.find(source, "\n", start, true)
+		if not newline then
+			return nil, nil
+		end
+		start = newline + 1
+	end
+	local newline = string.find(source, "\n", start, true)
+	local finish = if newline then newline - 1 else #source
+	if string.sub(source, finish, finish) == "\r" then
+		finish -= 1
+	end
+	return start, finish
+end
+
+local function shifts()
+	local list = {}
+	for step = 0, MAX_SHIFT * 2 do
+		table.insert(list, if step % 2 == 1 then (step + 1) // 2 else -(step // 2))
+	end
+	return list
+end
+local SHIFTS = shifts()
+
+-- An earlier fix can add or remove a line above a spot. This finds the line shift (0, then +1,
+-- -1, up to 5) at which every spot still holds its old text, or nil.
+local function findShift(source: string, spots: { { any } }): number?
+	for _, shift in SHIFTS do
+		local good = true
+		for _, spot in spots do
+			local start, finish = lineSpan(source, spot[1] + shift)
+			local at = start and start + spot[2] - 1
+			if not at or at + #spot[3] - 1 > (finish :: number) or string.sub(source, at, at + #spot[3] - 1) ~= spot[3] then
+				good = false
+				break
+			end
+		end
+		if good then
+			return shift
+		end
+	end
+	return nil
+end
+
+function Edit.readSource(script: LuaSourceContainer): string
+	local ok, source = pcall(ScriptEditorService.GetEditorSource, ScriptEditorService, script)
+	if ok and type(source) == "string" then
+		return source
+	end
+	return (script :: any).Source
+end
+
+-- ===== compute functions =====
+
+-- Replaces many spots as one change. Each spot is { line, column, old, new }.
+function Edit.computeReplaceMany(spots: { { any } })
+	local ordered = table.clone(spots)
+	-- The last spot goes first, thus an edit never moves a spot that is still to come.
+	table.sort(ordered, function(a, b)
+		if a[1] ~= b[1] then
+			return a[1] > b[1]
+		end
+		return a[2] > b[2]
+	end)
+	return function(source: string): string?
+		local shift = findShift(source, ordered)
+		if not shift then
+			return nil
+		end
+		for _, spot in ordered do
+			local start = lineSpan(source, spot[1] + shift) :: number
+			local at = start + spot[2] - 1
+			source = string.sub(source, 1, at - 1) .. spot[4] .. string.sub(source, at + #spot[3])
+		end
+		return source
+	end
+end
+
+-- Adds a new line after a line. `expect` is a pattern that the old line must match.
+-- lineNumber 0 adds the line at the top of the script.
+function Edit.computeInsertLineAfter(lineNumber: number, expect: string?, newLine: string)
+	return function(source: string): string?
+		local newline = if string.find(source, "\r\n", 1, true) then "\r\n" else "\n"
+		if lineNumber == 0 then
+			return newLine .. newline .. source
+		end
+		for _, shift in SHIFTS do
+			local start, finish = lineSpan(source, lineNumber + shift)
+			if start and finish and (expect == nil or string.find(string.sub(source, start, finish), expect)) then
+				return string.sub(source, 1, finish) .. newline .. newLine .. string.sub(source, finish + 1)
+			end
+		end
+		return nil
+	end
+end
+
+-- Runs computes one after the other. Any nil stops the whole change.
+function Edit.chain(computes: { (string) -> string? })
+	return function(source: string): string?
+		for _, compute in computes do
+			local result = compute(source)
+			if result == nil then
+				return nil
+			end
+			source = result
+		end
+		return source
+	end
+end
+
+-- ===== preview =====
+
+local function splitLines(text: string): { string }
+	local lines = {}
+	for line in string.gmatch(text .. "\n", "(.-)\r?\n") do
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+-- Returns up to PREVIEW_LINES rows { kind = "-" | "+", line = number, text = string }, or nil and a reason.
+-- The changes are small (renames, one added line), so a greedy walk finds them.
+function Edit.preview(script: LuaSourceContainer, compute: (string) -> string?)
+	local old = Edit.readSource(script)
+	local new = compute(old)
+	if new == nil then
+		return nil, "The code changed after the audit. Run the audit again."
+	end
+	local a, b = splitLines(old), splitLines(new)
+	local rows = {}
+	local i, j = 1, 1
+	while (i <= #a or j <= #b) and #rows < PREVIEW_LINES do
+		if a[i] == b[j] then
+			i += 1
+			j += 1
+		elseif a[i] == b[j + 1] then
+			table.insert(rows, { kind = "+", line = j, text = b[j] })
+			j += 1
+		elseif a[i + 1] == b[j] then
+			table.insert(rows, { kind = "-", line = i, text = a[i] })
+			i += 1
+		else
+			if a[i] then
+				table.insert(rows, { kind = "-", line = i, text = a[i] })
+			end
+			if b[j] then
+				table.insert(rows, { kind = "+", line = j, text = b[j] })
+			end
+			i += 1
+			j += 1
+		end
+	end
+	return rows
+end
+
+-- ===== writing =====
+
+-- Runs `compute(oldSource) -> newSource?` on a script. A nil result cancels the edit.
+function Edit.update(script: LuaSourceContainer, compute: (string) -> string?): (boolean, string?)
+	local failure = nil
+	local ok, err = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(script, function(old)
+			local new = compute(old)
+			if new == nil then
+				failure = "The code changed after the audit. Run the audit again."
+			end
+			return new
+		end)
+	end)
+	if not ok then
+		return false, tostring(err)
+	end
+	if failure then
+		return false, failure
+	end
+	return true, nil
+end
+
+-- A fix for one script. Apply, preview and restore all use the same compute function.
+function Edit.scriptFix(script: LuaSourceContainer, label: string, compute: (string) -> string?, risky: boolean?)
+	return {
+		label = label,
+		risky = risky,
+		scripts = { script },
+		compute = compute,
+		apply = function()
+			return Edit.update(script, compute)
+		end,
+		preview = function()
+			return Edit.preview(script, compute)
+		end,
+	}
+end
+
+-- Puts a saved source back, but only when the script still holds what the fix wrote.
+function Edit.restore(script: LuaSourceContainer, original: string, written: string): (boolean, string?)
+	return Edit.update(script, function(current)
+		if current ~= written then
+			return nil
+		end
+		return original
+	end)
+end
+
+-- Runs a change as one undo step with a name. Returns ok, error.
+function Edit.record(name: string, change: () -> (boolean, string?)): (boolean, string?)
+	local recording = ChangeHistoryService:TryBeginRecording("Daily Helper: " .. name)
+	local ok, done, err = pcall(change)
+	if recording then
+		ChangeHistoryService:FinishRecording(
+			recording,
+			if ok and done then Enum.FinishRecordingOperation.Commit else Enum.FinishRecordingOperation.Cancel
+		)
+	end
+	if not ok then
+		return false, tostring(done)
+	end
+	return done, err
+end
+
+return Edit
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX14"><Properties><string name="Name">Lexer</string><ProtectedString name="Source"><![CDATA[-- Blanks comments and strings in Luau source. Each blanked character becomes a space and each
+-- newline stays, so a line and a column in the output point to the same text in the source.
+
+local Lexer = {}
+
+local function blank(text: string): string
+	return (string.gsub(text, "[^\n]", " "))
+end
+
+-- Returns the end of a long bracket that opens at `start` ("[[", "[==["), or nil.
+local function longBracketEnd(source: string, start: number): number?
+	local equals = string.match(source, "^%[(=*)%[", start)
+	if not equals then
+		return nil
+	end
+	local close = "]" .. equals .. "]"
+	local _, finish = string.find(source, close, start + #equals + 2, true)
+	return finish or #source
+end
+
+-- Returns the end of a quoted string that opens at `start`.
+local function quotedEnd(source: string, start: number, quote: string): number
+	local index = start + 1
+	local length = #source
+	while index <= length do
+		local char = string.sub(source, index, index)
+		if char == "\\" then
+			index += 2
+		elseif char == quote then
+			return index
+		elseif char == "\n" and quote ~= "`" then
+			return index - 1
+		else
+			index += 1
+		end
+	end
+	return length
+end
+
+-- Returns two texts: `code` with comments and strings blanked, and `withStrings` with
+-- only the comments blanked.
+function Lexer.strip(source: string): (string, string)
+	local code, withStrings = {}, {}
+	local index = 1
+	local length = #source
+	while index <= length do
+		local start = string.find(source, "[%-%[\"'`]", index)
+		if not start then
+			table.insert(code, string.sub(source, index))
+			table.insert(withStrings, string.sub(source, index))
+			break
+		end
+		local before = string.sub(source, index, start - 1)
+		table.insert(code, before)
+		table.insert(withStrings, before)
+		local char = string.sub(source, start, start)
+		local finish = nil
+		local isComment = false
+		if char == "-" then
+			if string.sub(source, start + 1, start + 1) == "-" then
+				isComment = true
+				finish = longBracketEnd(source, start + 2)
+				if not finish then
+					local lineEnd = string.find(source, "\n", start, true)
+					finish = if lineEnd then lineEnd - 1 else length
+				end
+			end
+		elseif char == "[" then
+			finish = longBracketEnd(source, start)
+		else
+			finish = quotedEnd(source, start, char)
+		end
+		if finish then
+			local piece = string.sub(source, start, finish)
+			table.insert(code, blank(piece))
+			table.insert(withStrings, if isComment then blank(piece) else piece)
+			index = finish + 1
+		else
+			table.insert(code, char)
+			table.insert(withStrings, char)
+			index = start + 1
+		end
+	end
+	return table.concat(code), table.concat(withStrings)
+end
+
+function Lexer.lines(text: string): { string }
+	local result = {}
+	for line in string.gmatch(text .. "\n", "(.-)\r?\n") do
+		table.insert(result, line)
+	end
+	return result
+end
+
+return Lexer
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX15"><Properties><string name="Name">Log</string><ProtectedString name="Source"><![CDATA[-- The Log tab store. Entries stay in the plugin settings for each place, never in the place.
+
+local Log = {}
+Log.__index = Log
+
+local MAX_ENTRIES = 300
+
+export type Entry = { time: number, kind: string, text: string }
+
+local function placeKey(): string
+	if game.PlaceId ~= 0 then
+		return "Log_" .. game.PlaceId
+	end
+	return "Log_local_" .. game.Name
+end
+
+function Log.new(plugin: Plugin)
+	local self = setmetatable({}, Log)
+	self.plugin = plugin
+	self.key = placeKey()
+	local saved = plugin:GetSetting(self.key)
+	self.entries = if type(saved) == "table" then saved else {}
+	self.changed = Instance.new("BindableEvent")
+	return self
+end
+
+function Log:add(kind: string, text: string)
+	table.insert(self.entries, { time = os.time(), kind = kind, text = text })
+	while #self.entries > MAX_ENTRIES do
+		table.remove(self.entries, 1)
+	end
+	self.plugin:SetSetting(self.key, self.entries)
+	self.changed:Fire()
+end
+
+function Log:clear()
+	table.clear(self.entries)
+	self.plugin:SetSetting(self.key, self.entries)
+	self.changed:Fire()
+end
+
+-- os.date in Roblox gives only tables, thus the clock text is built by hand.
+function Log.clock(time: number): string
+	local parts = os.date("*t", time)
+	return string.format("%02d:%02d:%02d", parts.hour, parts.min, parts.sec)
+end
+
+function Log.day(time: number): string
+	local parts = os.date("*t", time)
+	local months = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+	return string.format("%d %s, %02d:%02d", parts.day, months[parts.month], parts.hour, parts.min)
+end
+
+function Log:text(): string
+	local lines = {}
+	for _, entry in self.entries do
+		table.insert(lines, string.format("%s  [%s]  %s", Log.clock(entry.time), entry.kind, entry.text))
+	end
+	return table.concat(lines, "\n")
+end
+
+return Log
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX16"><Properties><string name="Name">Scanner</string><ProtectedString name="Source"><![CDATA[-- Collects the instances and scripts of a scope, then runs the chosen checks on them.
+
+local ScriptEditorService = game:GetService("ScriptEditorService")
+
+local Lexer = require(script.Parent.Lexer)
+
+local Scanner = {}
+
+Scanner.Checks = {
+	require(script.Parent.Checks.UiLayout),
+	require(script.Parent.Checks.Tree),
+	require(script.Parent.Checks.Scripts),
+	require(script.Parent.Checks.Security),
+	require(script.Parent.Checks.Performance),
+	require(script.Parent.Checks.LiveApi),
+}
+
+Scanner.PlaceRoots = {
+	"Workspace", "ReplicatedFirst", "ReplicatedStorage", "ServerScriptService", "ServerStorage",
+	"StarterGui", "StarterPack", "StarterPlayer", "Lighting", "SoundService", "Teams", "TextChatService",
+}
+
+local SEVERITY_ORDER = { Error = 1, Warning = 2, Info = 3 }
+-- Wally and other package folders hold code that the developer does not edit.
+local SKIP_NAMES = { _Index = true }
+
+local function readSource(item: LuaSourceContainer): string
+	local ok, source = pcall(ScriptEditorService.GetEditorSource, ScriptEditorService, item)
+	if ok and type(source) == "string" then
+		return source
+	end
+	local okSource, raw = pcall(function()
+		return (item :: any).Source
+	end)
+	return if okSource and type(raw) == "string" then raw else ""
+end
+
+function Scanner.placeRoots(): { Instance }
+	local roots = {}
+	for _, name in Scanner.PlaceRoots do
+		local service = game:FindFirstChildOfClass(name) or game:FindFirstChild(name)
+		if service then
+			table.insert(roots, service)
+		end
+	end
+	return roots
+end
+
+-- options: roots, enabled ({ [checkId] = true }), api, apiMessage, progress(text)
+function Scanner.run(options)
+	local started = os.clock()
+	local progress = options.progress or function() end
+	local lastYield = os.clock()
+	local function yield()
+		if os.clock() - lastYield > 0.03 then
+			task.wait()
+			lastYield = os.clock()
+		end
+	end
+
+	progress("Reading the place...")
+	local instances, scripts = {}, {}
+	local seen = {}
+	local function visit(item: Instance)
+		if seen[item] or SKIP_NAMES[item.Name] then
+			return
+		end
+		seen[item] = true
+		table.insert(instances, item)
+		if item:IsA("LuaSourceContainer") then
+			table.insert(scripts, item)
+		end
+	end
+	for _, root in options.roots do
+		visit(root)
+		for _, item in root:GetDescendants() do
+			if not item:FindFirstAncestor("_Index") then
+				visit(item)
+			end
+			yield()
+		end
+	end
+
+	local entries = {}
+	for index, item in scripts do
+		local raw = readSource(item)
+		local code, strings = Lexer.strip(raw)
+		table.insert(entries, {
+			script = item,
+			raw = raw,
+			code = code,
+			strings = strings,
+			codeLines = Lexer.lines(code),
+			stringLines = Lexer.lines(strings),
+		})
+		if index % 10 == 0 then
+			progress(string.format("Reading scripts %d / %d", index, #scripts))
+		end
+		yield()
+	end
+
+	local findings = {}
+	local ctx = {
+		roots = options.roots,
+		instances = instances,
+		scripts = entries,
+		api = options.api,
+		apiMessage = options.apiMessage,
+		yield = yield,
+	}
+	for _, check in Scanner.Checks do
+		if options.enabled[check.id] then
+			progress("Checking " .. string.lower(check.name) .. "...")
+			ctx.add = function(finding)
+				finding.check = check.id
+				finding.group = check.name
+				finding.tag = finding.tag or string.upper(check.name)
+				finding.key = table.concat({ check.id, finding.title, finding.path }, "|")
+				table.insert(findings, finding)
+			end
+			local ok, err = pcall(check.run, ctx)
+			if not ok then
+				table.insert(findings, {
+					check = check.id,
+					group = check.name,
+					tag = string.upper(check.name),
+					severity = "Info",
+					title = check.name .. " check stopped",
+					path = "Daily Helper",
+					text = "The check hit an error and its results are not complete: " .. tostring(err),
+					key = check.id .. "|error",
+				})
+			end
+		end
+	end
+
+	-- Scripts with the same code (copies of one rig or tool) give one finding with all copies.
+	-- Apply then fixes every copy.
+	local sourceId, nextId = {}, 0
+	local idOf = {}
+	for _, entry in entries do
+		if not sourceId[entry.raw] then
+			nextId += 1
+			sourceId[entry.raw] = nextId
+		end
+		idOf[entry.script] = sourceId[entry.raw]
+	end
+	local merged, kept = {}, {}
+	for _, finding in findings do
+		local target = finding.target
+		local id = typeof(target) == "Instance" and idOf[target]
+		if id then
+			local key = table.concat({ finding.check, finding.title, tostring(finding.line), id,
+				if finding.fix then finding.fix.label else "" }, "|")
+			local first = merged[key]
+			if first then
+				first.copies = first.copies or { first }
+				table.insert(first.copies, finding)
+				continue
+			end
+			merged[key] = finding
+		end
+		table.insert(kept, finding)
+	end
+	for _, finding in kept do
+		local copies = finding.copies
+		if copies then
+			finding.path ..= string.format("  ·  same code in %d more %s", #copies - 1, if #copies == 2 then "script" else "scripts")
+			finding.key ..= "|x" .. #copies
+			if finding.fix then
+				-- Keep each copy's own apply first. copies[1] is this finding, and its fix is
+				-- replaced below. Calling copy.fix.apply after that calls this new fix again,
+				-- with no end (stack overflow).
+				local applies, scripts = {}, {}
+				for _, copy in copies do
+					if copy.fix then
+						table.insert(applies, copy.fix.apply)
+						for _, item in copy.fix.scripts or {} do
+							table.insert(scripts, item)
+						end
+					end
+				end
+				finding.fix = {
+					label = finding.fix.label .. string.format(" in %d scripts", #copies),
+					risky = finding.fix.risky,
+					-- The copies hold the same code, so the first copy's preview shows the change.
+					preview = finding.fix.preview,
+					scripts = scripts,
+					apply = function()
+						for _, apply in applies do
+							local ok, err = apply()
+							if not ok then
+								return false, err
+							end
+						end
+						return true
+					end,
+				}
+			end
+		end
+	end
+	findings = kept
+
+	table.sort(findings, function(a, b)
+		local sa, sb = SEVERITY_ORDER[a.severity] or 9, SEVERITY_ORDER[b.severity] or 9
+		if sa ~= sb then
+			return sa < sb
+		end
+		return a.key < b.key
+	end)
+
+	local counts = { Error = 0, Warning = 0, Info = 0 }
+	for _, finding in findings do
+		counts[finding.severity] = (counts[finding.severity] or 0) + 1
+	end
+	-- Each kind of problem costs once, and many hits of it cost a little more. A big place with
+	-- one old habit in 200 lines does not drop to zero.
+	local WEIGHTS = { Error = 12, Warning = 4, Info = 1 }
+	local rules = {}
+	for _, finding in findings do
+		-- "Deprecated: :connect" and "Deprecated: .userId" are one rule.
+		local title = string.gsub(string.match(finding.title, "^[^:]+") or finding.title, "%d+", "#")
+		local rule = finding.severity .. "|" .. finding.check .. "|" .. title
+		rules[rule] = (rules[rule] or 0) + 1
+	end
+	local penalty = 0
+	for rule, hits in rules do
+		local weight = WEIGHTS[string.match(rule, "^(%a+)")] or 1
+		penalty += weight * (1 + 0.5 * math.log(hits, 2))
+	end
+	local score = math.clamp(math.floor(100 - penalty + 0.5), 0, 100)
+
+	return findings, {
+		scripts = #scripts,
+		instances = #instances,
+		seconds = os.clock() - started,
+		counts = counts,
+		score = score,
+		time = os.time(),
+	}
+end
+
+return Scanner
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX17"><Properties><string name="Name">Theme</string><ProtectedString name="Source"><![CDATA[-- Neo-Brutalism with a simple palette: cream, white, black and one yellow. Thick black borders and
+-- hard black shadows do the work that gradients and glows do in other styles.
+
+local Theme = {}
+
+local function hex(value: string): Color3
+	return Color3.fromHex(value)
+end
+
+local COLORS = {
+	-- All text is black. Size and weight show the order of importance, not a grey tone.
+	bg = hex("FFF4E0"), card = hex("FFFFFF"), ink = hex("111111"), body = hex("111111"), muted = hex("111111"),
+	yellow = hex("FFD23F"), dot = hex("EADFC8"), white = hex("FFFFFF"), dim = hex("111111"),
+	Error = hex("FF5C5C"), Warning = hex("FF9F1C"), Info = hex("4D96FF"), ok = hex("2EC4B6"),
+}
+
+-- Sizes of the style, in pixels.
+Theme.BORDER = 2
+Theme.SHADOW = 5
+Theme.RADIUS = 10
+
+Theme.Font = {
+	-- Montserrat for all text. Body text uses Medium, because the thin strokes of Regular look faint
+	-- at small sizes.
+	Regular = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Medium),
+	Medium = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.SemiBold),
+	Bold = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Bold),
+	Title = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.ExtraBold),
+	Display = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Heavy),
+	Mono = Font.new("rbxasset://fonts/families/RobotoMono.json", Enum.FontWeight.Regular),
+}
+
+-- One palette for the Light and the Dark Studio theme. The cream panel is the brand.
+function Theme.colors()
+	return COLORS
+end
+
+return Theme
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX18"><Properties><string name="Name">View</string><ProtectedString name="Source"><![CDATA[-- The dock window in Neo-Brutalism: a start screen with a liquid blob, an Information screen, and the
+-- main screen with the tabs Scan, Findings and Log. The layout follows the FigCraft mockup v2.
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Theme = require(script.Parent.Theme)
+local Log = require(script.Parent.Log)
+
+local Font = Theme.Font
+local BORDER, SHADOW, RADIUS = Theme.BORDER, Theme.SHADOW, Theme.RADIUS
+
+local View = {}
+View.__index = View
+
+local PAGE_SIZE = 40
+local TABS = { "Scan", "Findings", "Log" }
+local FOOTER = "Lawak Studio © 2026"
+local HEADER_HEIGHT = 116
+local FOOTER_HEIGHT = 28
+
+-- The liquid blob: { x, y, diameter } around the center, the same circles as the mockup.
+local BLOB = { { -38, -18, 120 }, { 40, 6, 108 }, { -6, 44, 96 }, { 30, -50, 70 }, { -62, 40, 56 } }
+
+-- Text size choices. Plugin windows get no Windows display scale, so on a 150% screen the
+-- developer picks 150% and the panel matches the size of Studio's own text.
+local SCALES = { 1, 1.25, 1.5, 1.75 }
+
+local CHECK_COLORS = { ui = "yellow", tree = "Info", scripts = "Warning", security = "Error", performance = "ok", api = "ink" }
+
+-- ===== small builders =====
+
+local function make(className: string, props: { [string]: any }?, children: { Instance }?): any
+	local item = Instance.new(className)
+	for key, value in props or {} do
+		if key ~= "Parent" then
+			item[key] = value
+		end
+	end
+	for _, child in children or {} do
+		child.Parent = item
+	end
+	if props and props.Parent then
+		item.Parent = props.Parent
+	end
+	return item
+end
+
+local function corner(radius: number)
+	return make("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function round()
+	return make("UICorner", { CornerRadius = UDim.new(1, 0) })
+end
+
+local function border(color: Color3, thickness: number?)
+	return make("UIStroke", { Color = color, Thickness = thickness or BORDER, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+end
+
+local function padding(top: number, right: number?, bottom: number?, left: number?)
+	return make("UIPadding", {
+		PaddingTop = UDim.new(0, top),
+		PaddingRight = UDim.new(0, right or top),
+		PaddingBottom = UDim.new(0, bottom or top),
+		PaddingLeft = UDim.new(0, left or right or top),
+	})
+end
+
+local function list(direction: Enum.FillDirection, gap: number, align: Enum.HorizontalAlignment?)
+	return make("UIListLayout", {
+		FillDirection = direction,
+		Padding = UDim.new(0, gap),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		HorizontalAlignment = align or Enum.HorizontalAlignment.Left,
+		-- A row centers its items. A column starts at the top, also when it is short.
+		VerticalAlignment = if direction == Enum.FillDirection.Horizontal then Enum.VerticalAlignment.Center
+			else Enum.VerticalAlignment.Top,
+	})
+end
+
+local function scroller(name: string, gap: number, sidePadding: number)
+	return make("ScrollingFrame", {
+		Name = name, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 6, ScrollBarImageColor3 = Color3.fromHex("111111"),
+		VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar, Visible = false,
+	}, { padding(14, sidePadding, 18, sidePadding), list(Enum.FillDirection.Vertical, gap) })
+end
+
+-- Small text reads poorly in a narrow dock, so each small size goes up one step and 12 px is the floor.
+local SIZE_UP = { [10] = 12, [11] = 12, [12] = 13, [13] = 14 }
+
+function View:label(text: string, size: number, color: Color3, font: Font?, props: { [string]: any }?)
+	local item = make("TextLabel", {
+		BackgroundTransparency = 1, Text = text, TextSize = SIZE_UP[size] or size, TextColor3 = color, FontFace = font or Font.Regular,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, RichText = false,
+		-- A little more space between wrapped lines keeps a paragraph easy to follow.
+		LineHeight = 1.15,
+	})
+	for key, value in props or {} do
+		item[key] = value
+	end
+	return item
+end
+
+-- A Neo-Brutalism box: a hard black shadow and a face with a thick black border.
+-- opts: height (fixed) or none (the face grows with its content), shadow, radius, face ("Frame" or
+-- "TextButton"), LayoutOrder, Parent, width (UDim, default full width).
+function View:box(fill: Color3, opts)
+	local C = self.C
+	local shadow = opts.shadow or SHADOW
+	local radius = opts.radius or RADIUS
+	local width = opts.width or UDim.new(1, 0)
+	local holder = make("Frame", {
+		BackgroundTransparency = 1, LayoutOrder = opts.LayoutOrder or 0,
+		Size = if opts.height then UDim2.new(width.Scale, width.Offset, 0, opts.height + shadow) else UDim2.new(width, UDim.new(0, 0)),
+		AutomaticSize = if opts.height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y,
+		Position = opts.Position or UDim2.new(),
+		AnchorPoint = opts.AnchorPoint or Vector2.zero,
+	})
+	local shade
+	if shadow > 0 then
+		shade = make("Frame", {
+			Name = "Shadow", BackgroundColor3 = C.ink, BorderSizePixel = 0, Position = UDim2.fromOffset(shadow, shadow),
+			Size = if opts.height then UDim2.new(1, -shadow, 1, -shadow) else UDim2.new(1, -shadow, 0, 0),
+			Parent = holder,
+		}, { corner(radius) })
+	end
+	local face = make(opts.face or "Frame", {
+		Name = "Face", BackgroundColor3 = fill, BorderSizePixel = 0,
+		Size = if opts.height then UDim2.new(1, -shadow, 1, -shadow) else UDim2.new(1, -shadow, 0, 0),
+		AutomaticSize = if opts.height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y,
+		Parent = holder,
+	}, { corner(radius), border(C.ink) })
+	if face:IsA("TextButton") then
+		face.AutoButtonColor = false
+		face.Text = ""
+	end
+	-- A growing face moves its shadow with it. A scale size would feed back into the holder size.
+	-- AbsoluteSize is in screen pixels, after the text size scale, so divide by that scale.
+	if shade and not opts.height then
+		local function follow()
+			local scale = if self.uiScale then self.uiScale.Scale else 1
+			shade.Size = UDim2.new(1, -shadow, 0, math.floor(face.AbsoluteSize.Y / scale + 0.5))
+		end
+		face:GetPropertyChangedSignal("AbsoluteSize"):Connect(follow)
+		follow()
+	end
+	if opts.Parent then
+		holder.Parent = opts.Parent
+	end
+	return holder, face
+end
+
+-- A pressable box: the face sinks onto its shadow while the mouse is down.
+function View:button(text: string, fill: Color3, onClick: () -> (), opts)
+	opts = opts or {}
+	local C = self.C
+	local size = opts.textSize or 13
+	local shadow = opts.shadow or 3
+	local width = opts.width or UDim.new(0, math.floor(#text * (SIZE_UP[size] or size) * 0.66) + 28)
+	local holder, face = self:box(fill, {
+		height = opts.height or 32, shadow = shadow, radius = opts.radius or 8, face = "TextButton", width = width,
+		LayoutOrder = opts.LayoutOrder, Parent = opts.Parent, Position = opts.Position, AnchorPoint = opts.AnchorPoint,
+	})
+	self:label(text, size, opts.textColor or C.ink, opts.font or Font.Bold, {
+		Size = UDim2.fromScale(1, 1), AutomaticSize = Enum.AutomaticSize.None,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd, Parent = face,
+	})
+	local function lift()
+		face.Position = UDim2.new()
+	end
+	face.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and shadow > 0 then
+			face.Position = UDim2.fromOffset(shadow - 1, shadow - 1)
+		end
+	end)
+	face.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			lift()
+		end
+	end)
+	face.MouseLeave:Connect(lift)
+	face.Activated:Connect(onClick)
+	return holder, face
+end
+
+function View:checkbox(on: boolean, position: UDim2)
+	local C = self.C
+	local box = make("Frame", { BackgroundColor3 = if on then C.yellow else C.card, Position = position, Size = UDim2.fromOffset(18, 18) }, {
+		corner(4), border(C.ink),
+	})
+	if on then
+		self:label("✓", 14, C.ink, Font.Bold, {
+			Size = UDim2.fromScale(1, 1), AutomaticSize = Enum.AutomaticSize.None,
+			TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center, Parent = box,
+		})
+	end
+	return box
+end
+
+function View:tag(text: string, fill: Color3, order: number?)
+	local C = self.C
+	local tag = make("Frame", { BackgroundColor3 = fill, Size = UDim2.fromOffset(0, 24), AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = order or 0 }, {
+		corner(6), border(C.ink), padding(0, 8, 0, 8),
+	})
+	self:label(text, 10, C.ink, Font.Bold, {
+		Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, TextWrapped = false,
+		TextYAlignment = Enum.TextYAlignment.Center, Parent = tag,
+	})
+	return tag
+end
+
+-- ===== the window =====
+
+function View.new(widget, app)
+	local self = setmetatable({}, View)
+	self.widget = widget
+	self.app = app
+	self.shown = PAGE_SIZE
+	self:build()
+	return self
+end
+
+function View:build()
+	self.C = Theme.colors()
+	local C = self.C
+	self:stopBlob()
+	if self.root then
+		self.root:Destroy()
+	end
+	self.widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local root = make("Frame", { Name = "DailyHelper", BackgroundColor3 = C.bg, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ClipsDescendants = true })
+	self.root = root
+	self.uiScale = make("UIScale", { Parent = root })
+	self:applyScale()
+
+	self:label(FOOTER, 11, C.muted, Font.Medium, {
+		Name = "Footer", AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1),
+		Size = UDim2.new(1, 0, 0, FOOTER_HEIGHT), AutomaticSize = Enum.AutomaticSize.None,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center, Parent = root,
+	})
+	local area = make("Frame", { Name = "Screens", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -FOOTER_HEIGHT), Parent = root })
+
+	self.intro = scroller("Start", 12, 20)
+	self.intro.Parent = area
+	self.info = scroller("Information", 14, 16)
+	self.info.Parent = area
+
+	-- Main screen: header, tabs, pages.
+	local main = make("Frame", { Name = "Main", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, Parent = area })
+	self.main = main
+	local header = make("Frame", { Name = "Header", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, HEADER_HEIGHT), Parent = main })
+	self:label("Daily Helper", 21, C.ink, Font.Display, { Position = UDim2.fromOffset(16, 12), Size = UDim2.new(1, -170, 0, 26), AutomaticSize = Enum.AutomaticSize.None, Parent = header })
+	self:label(self.app.versionText, 11, C.muted, Font.Medium, { Position = UDim2.fromOffset(16, 40), Size = UDim2.new(1, -170, 0, 14), AutomaticSize = Enum.AutomaticSize.None, Parent = header })
+	local _, pill = self:box(C.card, {
+		height = 26, shadow = 3, radius = 13, width = UDim.new(0, 100), Parent = header,
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -52, 0, 16),
+	})
+	self.apiDot = make("Frame", { BackgroundColor3 = C.muted, Position = UDim2.new(0, 10, 0.5, -4), Size = UDim2.fromOffset(8, 8), Parent = pill }, { round(), border(C.ink, 1) })
+	self.apiText = self:label("API", 11, C.ink, Font.Bold, {
+		Position = UDim2.fromOffset(24, 0), Size = UDim2.new(1, -28, 1, 0), AutomaticSize = Enum.AutomaticSize.None,
+		TextYAlignment = Enum.TextYAlignment.Center, TextWrapped = false, Parent = pill,
+	})
+	self:button("i", C.card, function()
+		self.app.actions.showInfo()
+	end, { width = UDim.new(0, 28), height = 26, shadow = 3, radius = 13, textSize = 14, font = Font.Display, Parent = header, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, 0, 16) })
+
+	local tabs = make("Frame", { Name = "Tabs", BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 66), Size = UDim2.new(1, -32, 0, 38), Parent = header })
+	self.tabs = tabs
+
+	local body = make("Frame", { Name = "Body", BackgroundTransparency = 1, Position = UDim2.fromOffset(0, HEADER_HEIGHT), Size = UDim2.new(1, 0, 1, -HEADER_HEIGHT), Parent = main })
+	self.pages = {}
+	for _, name in TABS do
+		self.pages[name] = scroller(name, 12, 16)
+		self.pages[name].Parent = body
+	end
+
+	-- The search bar stays outside the list, so typing does not rebuild it and keeps the focus.
+	local SEARCH_HEIGHT = 46
+	local searchBar = make("Frame", { Name = "Search", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, SEARCH_HEIGHT), Visible = false, Parent = body }, {
+		padding(8, 16, 0, 16),
+	})
+	self.searchBar = searchBar
+	local _, searchFace = self:box(C.card, { height = 32, shadow = 3, radius = 8, Parent = searchBar })
+	local searchBox = make("TextBox", {
+		BackgroundTransparency = 1, ClearTextOnFocus = false, Text = self.app.state.query or "",
+		PlaceholderText = "Search findings: title, script, text", PlaceholderColor3 = Color3.fromHex("6B6B6B"),
+		TextColor3 = C.ink, TextSize = 14, FontFace = Font.Regular, TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = searchFace,
+	})
+	self.searchBox = searchBox
+	local searchSerial = 0
+	searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+		-- Wait for a short pause in typing, then filter once.
+		searchSerial += 1
+		local serial = searchSerial
+		task.delay(0.2, function()
+			if serial == searchSerial and searchBox.Text ~= self.app.state.query then
+				self.app.actions.setQuery(searchBox.Text)
+			end
+		end)
+	end)
+	self.pages.Findings.Position = UDim2.fromOffset(0, SEARCH_HEIGHT)
+	self.pages.Findings.Size = UDim2.new(1, 0, 1, -SEARCH_HEIGHT)
+
+	self.overlay = make("Frame", { Name = "Overlay", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 10, Visible = false, Parent = root })
+	root.Parent = self.widget
+	self:render()
+end
+
+-- The root is 1/scale of the window, and the UIScale grows it back to fill the window. Roblox
+-- draws the text at the grown size, so it stays sharp.
+function View:applyScale()
+	local scale = self.app.state.scale
+	self.uiScale.Scale = scale
+	self.root.Size = UDim2.fromScale(1 / scale, 1 / scale)
+end
+
+function View:clear(target: Instance)
+	for _, child in target:GetChildren() do
+		if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+			child:Destroy()
+		end
+	end
+	return target
+end
+
+function View:render()
+	local state = self.app.state
+	local screen = state.screen
+	self.intro.Visible = screen == "intro"
+	self.info.Visible = screen == "info"
+	self.main.Visible = screen == "main"
+	if screen == "intro" then
+		self:renderIntro()
+	else
+		self:stopBlob()
+		if screen == "info" then
+			self:renderInfo()
+		else
+			self:renderMain()
+		end
+	end
+	self:renderOverlay()
+end
+
+-- ===== the liquid blob =====
+
+function View:stopBlob()
+	if self.blobConnection then
+		self.blobConnection:Disconnect()
+		self.blobConnection = nil
+	end
+end
+
+-- Three layers of the same circles: shadow, black outline, yellow fill. The fill layer covers the
+-- inner outlines, so the circles read as one liquid shape with one outline.
+-- Motion: each circle sits on a rotating arm and travels a small circle. Roblox draws a moving
+-- frame at whole pixels, so a slow Position change steps one pixel at a time and looks laggy. A
+-- Rotation change draws with a smooth transform, so the arms move without steps.
+function View:blob(parent: Instance)
+	local C = self.C
+	local stage = make("Frame", { Name = "Blob", BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(240, 220), Parent = parent })
+	local scale = make("UIScale", { Scale = 0.6, Parent = stage })
+
+	-- One arm per circle and per layer. arms[i] holds the three arms of circle i.
+	local arms = {}
+	local function arm(layerFrame, x, y, reach, diameter, color, zIndex, outline)
+		local pivot = make("Frame", {
+			BackgroundTransparency = 1, Position = UDim2.new(0.5, x, 0.5, y), Size = UDim2.fromOffset(0, 0),
+			ZIndex = zIndex, Parent = layerFrame,
+		})
+		local circle = make("Frame", {
+			BackgroundColor3 = color, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(reach, 0), Size = UDim2.fromOffset(diameter, diameter), ZIndex = zIndex, Parent = pivot,
+		}, { round() })
+		if outline then
+			border(C.ink).Parent = circle
+		end
+		return pivot
+	end
+	local layers = { { C.ink, 8, 0 }, { C.ink, 0, 6 }, { C.yellow, 0, 0 } }
+	for index, spec in layers do
+		local layerFrame = make("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = index, Parent = stage })
+		for i, circle in BLOB do
+			arms[i] = arms[i] or {}
+			-- The reach and the speed differ per circle, so the outline keeps changing.
+			local reach = 6 + (i % 3) * 2
+			table.insert(arms[i], arm(layerFrame, circle[1] + spec[2], circle[2] + spec[2], reach, circle[3] + spec[3], spec[1], index, false))
+		end
+	end
+	local DROPS = { { 100, -84, 22 }, { 118, -46, 13 } }
+	local dropArms = {}
+	for _, drop in DROPS do
+		table.insert(dropArms, arm(stage, drop[1], drop[2], 5, drop[3], C.yellow, 5, true))
+	end
+
+	local started = os.clock()
+	local function step()
+		local t = os.clock() - started
+		for i, group in arms do
+			-- Degrees per second: 30 to 54, every second circle turns the other way.
+			local speed = (30 + i * 6) * (if i % 2 == 0 then -1 else 1)
+			local angle = i * 70 + t * speed
+			for _, pivot in group do
+				pivot.Rotation = angle
+			end
+		end
+		for i, pivot in dropArms do
+			pivot.Rotation = i * 120 + t * (if i == 1 then 60 else -80)
+		end
+	end
+	step()
+	self:stopBlob()
+	self.blobConnection = RunService.RenderStepped:Connect(step)
+	TweenService:Create(scale, TweenInfo.new(0.7, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+end
+
+-- ===== start screen =====
+
+function View:renderIntro()
+	local C, app = self.C, self.app
+	local target = self:clear(self.intro)
+
+	local area = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 236), LayoutOrder = 1, Parent = target })
+	self:blob(area)
+
+	self:label("Daily Helper", 34, C.ink, Font.Display, { TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 2, Parent = target })
+	self:label("A daily check-up for your Roblox place.", 14, C.body, Font.Medium, { TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 3, Parent = target })
+
+	local _, card = self:box(C.card, { LayoutOrder = 4, Parent = target })
+	padding(14).Parent = card
+	list(Enum.FillDirection.Vertical, 8).Parent = card
+	self:tag("LATEST ROBLOX API", C.yellow, 1).Parent = card
+	self:label("Each scan reads the API of your Studio build from Roblox Creator. The checks know what Roblox marked deprecated this week.",
+		13, C.body, Font.Regular, { LayoutOrder = 2, Parent = card })
+	self:label(if app.apiVersion then "Last read: " .. app.apiVersion else "First read: when you run the first scan.",
+		11, C.muted, Font.Mono, { LayoutOrder = 3, Parent = card })
+
+	self:button("Start", C.yellow, app.actions.start, { width = UDim.new(1, 0), height = 50, shadow = 5, textSize = 17, font = Font.Title, LayoutOrder = 5, Parent = target })
+	self:button("Information", C.card, app.actions.showInfo, { width = UDim.new(1, 0), height = 44, shadow = 4, textSize = 15, font = Font.Title, LayoutOrder = 6, Parent = target })
+	self:scalePicker(7, target)
+end
+
+-- A row of size chips: "Text size  100%  125%  150%  175%".
+function View:scalePicker(order: number, parent: Instance)
+	local C, app = self.C, self.app
+	local row = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order, Parent = parent }, {
+		list(Enum.FillDirection.Horizontal, 6),
+	})
+	self:label("Text size", 12, C.ink, Font.Bold, {
+		Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, TextWrapped = false,
+		TextYAlignment = Enum.TextYAlignment.Center, LayoutOrder = 0, Parent = row,
+	})
+	for index, scale in SCALES do
+		local active = math.abs(app.state.scale - scale) < 0.01
+		local chip = make("TextButton", {
+			AutoButtonColor = false, BackgroundColor3 = if active then C.ink else C.card,
+			Text = math.floor(scale * 100 + 0.5) .. "%", TextSize = 12, FontFace = Font.Bold,
+			TextColor3 = if active then C.white else C.ink, Size = UDim2.fromOffset(0, 26),
+			AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = index, Parent = row,
+		}, { round(), padding(0, 9, 0, 9), border(C.ink) })
+		chip.Activated:Connect(function()
+			app.actions.setScale(scale)
+		end)
+	end
+end
+
+-- ===== Information screen =====
+
+function View:renderInfo()
+	local C, app = self.C, self.app
+	local target = self:clear(self.info)
+
+	local top = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 38), LayoutOrder = 1, Parent = target })
+	self:button("← Back", C.card, app.actions.back, { width = UDim.new(0, 88), height = 32, Parent = top })
+	self:label("Information", 22, C.ink, Font.Display, {
+		Position = UDim2.fromOffset(104, 0), Size = UDim2.new(1, -104, 0, 34), AutomaticSize = Enum.AutomaticSize.None,
+		TextYAlignment = Enum.TextYAlignment.Center, Parent = top,
+	})
+
+	local function card(order: number, fill: Color3, title: string)
+		local _, face = self:box(fill, { LayoutOrder = order, Parent = target })
+		padding(14).Parent = face
+		list(Enum.FillDirection.Vertical, 8).Parent = face
+		self:label(title, 11, if fill == C.card then C.muted else C.ink, Font.Bold, { LayoutOrder = 0, Parent = face })
+		return face
+	end
+
+	local checks = card(2, C.card, "WHAT IT CHECKS")
+	for index, check in app.checks do
+		local row = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = index, Parent = checks })
+		make("Frame", { BackgroundColor3 = C[CHECK_COLORS[check.id]] or C.yellow, Position = UDim2.fromOffset(0, 2), Size = UDim2.fromOffset(16, 16), Parent = row }, { corner(4), border(C.ink) })
+		local text = make("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -28, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = row }, {
+			list(Enum.FillDirection.Vertical, 1),
+		})
+		self:label(check.name, 14, C.ink, Font.Bold, { LayoutOrder = 1, Parent = text })
+		self:label(check.desc, 12, C.muted, Font.Regular, { LayoutOrder = 2, Parent = text })
+	end
+
+	local source = card(3, C.card, "WHERE THE KNOWLEDGE COMES FROM")
+	self:label("The Roblox API dump for your Studio build, read from setup.rbxcdn.com. It updates when Roblox ships a new Studio, with no plugin update. "
+		.. "A member that Roblox marks deprecated shows up in the next scan.", 13, C.body, Font.Regular, { LayoutOrder = 1, Parent = source })
+	self:label(if app.apiVersion then "Last read: " .. app.apiVersion else "Not read yet.", 11, C.muted, Font.Mono, { LayoutOrder = 2, Parent = source })
+
+	self:scalePicker(5, target)
+
+	local safe = card(4, C.yellow, "YOUR PLACE STAYS YOURS")
+	self:label("It only reads your place. It changes something only when you press Apply, and it asks first. "
+		.. "The Log tab records every run and every choice. Nothing leaves your computer.", 13, C.ink, Font.Medium, { LayoutOrder = 1, Parent = safe })
+
+	self:button(if app.state.infoFrom == "main" then "Back to the audit" else "Start", C.yellow, function()
+		if app.state.infoFrom == "main" then
+			app.actions.back()
+		else
+			app.actions.start()
+		end
+	end, { width = UDim.new(1, 0), height = 46, shadow = 5, textSize = 16, font = Font.Title, LayoutOrder = 6, Parent = target })
+end
+
+-- ===== main screen =====
+
+function View:renderMain()
+	local C, state = self.C, self.app.state
+	local status = state.apiStatus
+	self.apiText.Text = if status == "live" then "API live" elseif status == "cached" then "API cached"
+		elseif status == "offline" then "API offline" else "API ready"
+	self.apiDot.BackgroundColor3 = if status == "live" then C.ok elseif status == "cached" then C.Warning
+		elseif status == "offline" then C.Error else C.muted
+
+	self:clear(self.tabs)
+	local count = #state.findings
+	for index, name in TABS do
+		local active = state.tab == name
+		self:button(if name == "Findings" and count > 0 then "Findings " .. count else name, if active then C.yellow else C.card, function()
+			self.app.actions.setTab(name)
+		end, {
+			width = UDim.new(1 / #TABS, -6), height = 34, shadow = if active then 3 else 0, textSize = 13,
+			Position = UDim2.new((index - 1) / #TABS, (index - 1) * 3, 0, 0), Parent = self.tabs,
+		})
+	end
+	for name, page in self.pages do
+		page.Visible = state.tab == name
+	end
+	self.searchBar.Visible = state.tab == "Findings" and state.stats ~= nil
+	if state.tab == "Scan" then
+		self:renderScan()
+	elseif state.tab == "Findings" then
+		self:renderFindings()
+	else
+		self:renderLog()
+	end
+end
+
+function View:section(text: string, order: number, parent: Instance)
+	return self:label(text, 11, self.C.muted, Font.Bold, { LayoutOrder = order, Parent = parent })
+end
+
+function View:renderScan()
+	local C, state, actions = self.C, self.app.state, self.app.actions
+	local target = self:clear(self.pages.Scan)
+	local order = 0
+	local function nextOrder()
+		order += 1
+		return order
+	end
+
+	self:section("SCOPE", nextOrder(), target)
+	local _, segment = self:box(C.card, { height = 38, shadow = 3, radius = 8, LayoutOrder = nextOrder(), Parent = target })
+	for index, option in { { "place", "Whole place" }, { "selection", "Selection" } } do
+		local active = state.scope == option[1]
+		local choice = make("TextButton", {
+			AutoButtonColor = false, BackgroundColor3 = C.yellow, BackgroundTransparency = if active then 0 else 1,
+			Text = option[2], TextSize = 13, FontFace = Font.Bold, TextColor3 = if active then C.ink else C.muted,
+			Position = UDim2.new((index - 1) * 0.5, if index == 1 then 4 else 2, 0, 4), Size = UDim2.new(0.5, -6, 1, -8),
+			Parent = segment,
+		}, { corner(6) })
+		if active then
+			border(C.ink).Parent = choice
+		end
+		choice.Activated:Connect(function()
+			actions.setScope(option[1])
+		end)
+	end
+
+	self:section("CHECKS", nextOrder(), target)
+	for _, check in self.app.checks do
+		local on = state.enabled[check.id]
+		local _, row = self:box(C.card, { height = 50, shadow = if on then 3 else 0, radius = 8, face = "TextButton", LayoutOrder = nextOrder(), Parent = target })
+		self:checkbox(on, UDim2.fromOffset(12, 15)).Parent = row
+		self:label(check.name, 14, C.ink, Font.Bold, { Position = UDim2.fromOffset(42, 7), Size = UDim2.new(1, -54, 0, 18), AutomaticSize = Enum.AutomaticSize.None, Parent = row })
+		self:label(check.desc, 12, C.muted, Font.Regular, {
+			Position = UDim2.fromOffset(42, 26), Size = UDim2.new(1, -54, 0, 14), AutomaticSize = Enum.AutomaticSize.None,
+			TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+		})
+		row.Activated:Connect(function()
+			actions.toggleCheck(check.id)
+		end)
+	end
+
+	local _, run = self:button(if state.running then state.progress else "Run Audit", if state.running then C.card else C.yellow, function()
+		if not state.running then
+			actions.run()
+		end
+	end, { width = UDim.new(1, 0), height = 48, shadow = if state.running then 0 else 5, textSize = 16, font = Font.Title, LayoutOrder = nextOrder(), Parent = target })
+	self.runLabel = run:FindFirstChildOfClass("TextLabel")
+
+	local stats = state.stats
+	if stats then
+		local _, card = self:box(C.card, { height = 118, LayoutOrder = nextOrder(), Parent = target })
+		self:label("LAST AUDIT  ·  " .. Log.day(stats.time), 11, C.muted, Font.Bold, { Position = UDim2.fromOffset(14, 12), Size = UDim2.new(1, -28, 0, 14), AutomaticSize = Enum.AutomaticSize.None, Parent = card })
+		self:label(string.format('%d<font size="13" color="#%s"> / 100</font>', stats.score, C.muted:ToHex()), 42, C.ink, Font.Display, {
+			RichText = true, Position = UDim2.fromOffset(14, 32), Size = UDim2.fromOffset(140, 48), AutomaticSize = Enum.AutomaticSize.None, Parent = card,
+		})
+		local counts = make("Frame", { BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 32), Size = UDim2.fromOffset(118, 56), Parent = card })
+		for index, kind in { "Error", "Warning", "Info" } do
+			local value = stats.counts[kind] or 0
+			local word = if kind == "Info" then "info" else string.lower(kind) .. (if value == 1 then "" else "s")
+			make("Frame", { BackgroundColor3 = C[kind], Position = UDim2.fromOffset(0, (index - 1) * 19 + 3), Size = UDim2.fromOffset(11, 11), Parent = counts }, { corner(3), border(C.ink, 1.5) })
+			self:label(value .. " " .. word, 13, C.ink, Font.Bold, { Position = UDim2.fromOffset(18, (index - 1) * 19), Size = UDim2.new(1, -18, 0, 17), AutomaticSize = Enum.AutomaticSize.None, Parent = counts })
+		end
+		self:label(string.format("%d scripts  ·  %d instances  ·  %.1f s", stats.scripts, stats.instances, stats.seconds), 12, C.muted, Font.Medium, {
+			Position = UDim2.fromOffset(14, 90), Size = UDim2.new(1, -28, 0, 14), AutomaticSize = Enum.AutomaticSize.None, Parent = card,
+		})
+	end
+end
+
+function View:setProgress(text: string)
+	if self.runLabel and self.runLabel.Parent then
+		self.runLabel.Text = text
+	end
+end
+
+-- ===== Findings =====
+
+local FILTERS = { { "All", "All" }, { "Error", "Errors" }, { "Warning", "Warnings" }, { "Info", "Info" } }
+
+local PREVIEW_COLORS = { ["-"] = Color3.fromHex("FFD9D9"), ["+"] = Color3.fromHex("D4F5E6") }
+
+-- The before/after lines of a script fix, computed from the script as it is now.
+function View:preview(finding, parent: Instance)
+	local C = self.C
+	local ok, rows, reason = pcall(finding.fix.preview)
+	local box = make("Frame", {
+		BackgroundColor3 = C.bg, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 5,
+		Parent = parent,
+	}, { corner(6), border(C.ink, 1.5), padding(6, 8, 6, 8), list(Enum.FillDirection.Vertical, 2) })
+	if not ok or not rows then
+		self:label(if ok then tostring(reason) else "No preview: " .. tostring(rows), 12, C.ink, Font.Bold, { Parent = box })
+		return
+	end
+	for index, row in rows do
+		local text = string.gsub(string.gsub(row.text, "	", "  "), "^%s+", function(space)
+			return string.rep(" ", math.min(#space, 8))
+		end)
+		self:label(string.format("%s %4d  %s", row.kind, row.line, text), 11, C.ink, Font.Mono, {
+			BackgroundTransparency = 0, BackgroundColor3 = PREVIEW_COLORS[row.kind], TextWrapped = false,
+			TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = index, Parent = box,
+		})
+	end
+end
+
+function View:card(finding, order: number)
+	local C, actions = self.C, self.app.actions
+	local decided = finding.status ~= nil and finding.status ~= "Failed"
+	local holder, face = self:box(if decided then C.bg else C.card, { shadow = if decided then 0 else SHADOW, LayoutOrder = order })
+	padding(12, 14, 12, 14).Parent = face
+	list(Enum.FillDirection.Vertical, 6).Parent = face
+
+	local tags = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = 1, Parent = face }, { list(Enum.FillDirection.Horizontal, 6) })
+	self:tag(finding.tag, C[finding.severity] or C.yellow, 1).Parent = tags
+	if finding.status then
+		self:tag(string.upper(finding.status), if finding.status == "Applied" then C.ok elseif finding.status == "Failed" then C.Error else C.card, 2).Parent = tags
+	end
+
+	self:label(finding.title, 15, C.ink, Font.Bold, { LayoutOrder = 2, Parent = face })
+	self:label(finding.path, 11, C.muted, Font.Mono, { LayoutOrder = 3, Parent = face })
+	self:label(finding.text, 13, C.body, Font.Regular, { LayoutOrder = 4, Parent = face })
+	if finding.fix then
+		self:label("Change: " .. finding.fix.label, 12, C.ink, Font.Bold, { LayoutOrder = 4, Parent = face })
+	end
+	if finding.fix and finding.fix.preview and not decided then
+		self:preview(finding, face)
+	end
+	if finding.note then
+		self:label(finding.note, 12, C.Error, Font.Bold, { LayoutOrder = 6, Parent = face })
+	end
+
+	local row = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 35), LayoutOrder = 7, Parent = face }, {
+		list(Enum.FillDirection.Horizontal, 8, Enum.HorizontalAlignment.Right),
+	})
+	local buttonOrder = 0
+	local function add(text, fill, onClick)
+		buttonOrder += 1
+		self:button(text, fill, onClick, { LayoutOrder = buttonOrder, Parent = row })
+	end
+	if finding.target then
+		local isScript = typeof(finding.target) == "Instance" and finding.target:IsA("LuaSourceContainer")
+		add(if isScript then "Open" else "Select", C.card, function()
+			actions.open(finding)
+		end)
+	end
+	if finding.status == "Applied" and finding.snapshots then
+		add("Restore", C.card, function()
+			actions.restore(finding)
+		end)
+	end
+	if not decided then
+		if finding.fix then
+			add("Skip", C.card, function()
+				actions.skip(finding)
+			end)
+			add("Apply", C.yellow, function()
+				actions.apply(finding)
+			end)
+		else
+			add("Mark reviewed", C.card, function()
+				actions.review(finding)
+			end)
+		end
+	end
+	return holder
+end
+
+function View:renderFindings()
+	local C, state, actions = self.C, self.app.state, self.app.actions
+	local target = self.pages.Findings
+	local keep = target.CanvasPosition
+	self:clear(target)
+
+	if not state.stats then
+		self:label("Run an audit on the Scan tab to see findings here.", 14, C.muted, Font.Medium, { LayoutOrder = 1, Parent = target })
+		return
+	end
+
+	local pending = self.app.pendingFixes()
+	if #pending > 0 then
+		local _, banner = self:box(C.yellow, { LayoutOrder = 1, Parent = target })
+		padding(14).Parent = banner
+		list(Enum.FillDirection.Vertical, 8).Parent = banner
+		self:label(string.format("%d %s a recommended change.", #pending, if #pending == 1 then "finding has" else "findings have"),
+			15, C.ink, Font.Bold, { LayoutOrder = 1, Parent = banner })
+		self:label("You know your map best. Read each one, then apply or skip it.", 13, C.ink, Font.Medium, { LayoutOrder = 2, Parent = banner })
+		self:button("Review changes", C.card, actions.openPrompt, { LayoutOrder = 3, Parent = banner })
+	end
+
+	local chips = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 2, Parent = target }, { list(Enum.FillDirection.Horizontal, 6) })
+	for index, filter in FILTERS do
+		local amount = if filter[1] == "All" then #state.findings else (state.stats.counts[filter[1]] or 0)
+		local active = state.filter == filter[1]
+		local chip = make("TextButton", {
+			AutoButtonColor = false, BackgroundColor3 = if active then C.ink else C.card,
+			Text = filter[2] .. " " .. amount, TextSize = 12, FontFace = Font.Bold,
+			TextColor3 = if active then C.white else C.ink, Size = UDim2.fromOffset(0, 28),
+			AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = index, Parent = chips,
+		}, { round(), padding(0, 11, 0, 11), border(C.ink) })
+		chip.Activated:Connect(function()
+			actions.setFilter(filter[1])
+		end)
+	end
+
+	local query = string.lower(state.query or "")
+	local function matches(finding): boolean
+		if query == "" then
+			return true
+		end
+		local text = string.lower(table.concat({ finding.title, finding.path, finding.text, finding.tag or "",
+			if finding.fix then finding.fix.label else "" }, " "))
+		return string.find(text, query, 1, true) ~= nil
+	end
+
+	local shown, total = 0, 0
+	for _, finding in state.findings do
+		if (state.filter == "All" or finding.severity == state.filter) and matches(finding) then
+			total += 1
+			if shown < self.shown then
+				shown += 1
+				self:card(finding, 10 + shown).Parent = target
+			end
+		end
+	end
+	if total == 0 then
+		self:label(if query ~= "" then "No finding matches \"" .. state.query .. "\"." else "Nothing here. Good work.",
+			14, C.muted, Font.Medium, { LayoutOrder = 3, Parent = target })
+	elseif total > shown then
+		self:button(string.format("Show more (%d left)", total - shown), C.card, function()
+			self.shown += PAGE_SIZE
+			self:render()
+		end, { width = UDim.new(1, 0), height = 38, LayoutOrder = 100000, Parent = target })
+	end
+	task.defer(function()
+		target.CanvasPosition = keep
+	end)
+end
+
+-- ===== Log =====
+
+local KIND_COLORS = { done = "ok", applied = "yellow", undo = "Info", redo = "Info", reviewed = "Warning", failed = "Error", skipped = "card", info = "card" }
+
+function View:renderLog()
+	local C, app = self.C, self.app
+	local target = self:clear(self.pages.Log)
+
+	local top = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 35), LayoutOrder = 1, Parent = target })
+	self:label("Session log", 17, C.ink, Font.Display, {
+		Size = UDim2.new(1, -160, 1, 0), AutomaticSize = Enum.AutomaticSize.None, TextYAlignment = Enum.TextYAlignment.Center, Parent = top,
+	})
+	local buttons = make("Frame", { BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.new(0, 160, 1, 0), Parent = top }, {
+		list(Enum.FillDirection.Horizontal, 8, Enum.HorizontalAlignment.Right),
+	})
+	self:button("Copy", C.card, app.actions.openCopy, { LayoutOrder = 1, Parent = buttons })
+	self:button("Clear", C.card, app.actions.clearLog, { LayoutOrder = 2, Parent = buttons })
+
+	local _, box = self:box(C.card, { LayoutOrder = 2, Parent = target })
+	padding(12).Parent = box
+	list(Enum.FillDirection.Vertical, 10).Parent = box
+	local entries = app.log.entries
+	if #entries == 0 then
+		self:label("No entries yet. A run, an apply, a skip and an undo each add a line.", 13, C.muted, Font.Regular, { Parent = box })
+	end
+	-- Newest first, thus the last choice shows without a scroll.
+	local first = math.max(1, #entries - 149)
+	for index = #entries, first, -1 do
+		local entry = entries[index]
+		local line = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = #entries - index, Parent = box })
+		self:label(Log.clock(entry.time), 11, C.muted, Font.Mono, { Size = UDim2.new(0, 64, 0, 16), AutomaticSize = Enum.AutomaticSize.None, Parent = line })
+		make("Frame", { BackgroundColor3 = C[KIND_COLORS[entry.kind] or "card"], Position = UDim2.fromOffset(68, 3), Size = UDim2.fromOffset(10, 10), Parent = line }, { corner(3), border(C.ink, 1.5) })
+		self:label(entry.text, 13, C.body, Font.Regular, { Position = UDim2.fromOffset(86, 0), Size = UDim2.new(1, -86, 0, 0), Parent = line })
+	end
+
+	local _, note = self:box(C.yellow, { shadow = 0, LayoutOrder = 3, Parent = target })
+	padding(12, 14, 12, 14).Parent = note
+	list(Enum.FillDirection.Vertical, 6).Parent = note
+	self:label("The log stays in the plugin settings for this place. The plugin changes your place only when you press Apply.", 12, C.ink, Font.Medium, { LayoutOrder = 1, Parent = note })
+	self:label("Copy shows the log as text that you can select and copy.", 12, C.ink, Font.Regular, { LayoutOrder = 2, Parent = note })
+end
+
+-- ===== Overlays: the apply prompt and the copy box =====
+
+function View:dimmer()
+	local C = self.C
+	self:clear(self.overlay)
+	make("TextButton", {
+		AutoButtonColor = false, Text = "", BackgroundColor3 = C.dim, BackgroundTransparency = 0.45,
+		Size = UDim2.fromScale(1, 1), Parent = self.overlay,
+	})
+	local holder, face = self:box(C.card, {
+		Parent = self.overlay, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), width = UDim.new(1, -28),
+	})
+	make("UISizeConstraint", { MaxSize = Vector2.new(460, math.huge), Parent = holder })
+	padding(18).Parent = face
+	list(Enum.FillDirection.Vertical, 10).Parent = face
+	return face
+end
+
+function View:renderOverlay()
+	local state = self.app.state
+	if state.screen == "main" and state.overlay == "prompt" then
+		self:renderPrompt()
+	elseif state.screen == "main" and state.overlay == "copy" then
+		self:renderCopy()
+	else
+		self.overlay.Visible = false
+		self:clear(self.overlay)
+	end
+end
+
+function View:renderPrompt()
+	local C, app = self.C, self.app
+	local state, actions = app.state, app.actions
+	local pending = app.pendingFixes()
+	if #pending == 0 then
+		state.overlay = nil
+		self.overlay.Visible = false
+		return
+	end
+	self.overlay.Visible = true
+	local card = self:dimmer()
+	self:label("Apply recommended changes?", 18, C.ink, Font.Display, { LayoutOrder = 1, Parent = card })
+	self:label(string.format("The audit can make %s for you. Pick only the ones that fit your map. Nothing changes until you press Apply.",
+		if #pending == 1 then "1 change" else #pending .. " changes"), 13, C.body, Font.Regular, { LayoutOrder = 2, Parent = card })
+
+	local scroll = make("ScrollingFrame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 3, Parent = card,
+		Size = UDim2.new(1, 0, 0, math.min(#pending * 62, 260)), CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6, ScrollBarImageColor3 = C.ink,
+		VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar,
+	}, { list(Enum.FillDirection.Vertical, 8), padding(0, 4, 4, 0) })
+	local picked = 0
+	for index, finding in pending do
+		local on = state.picked[finding] == true
+		if on then
+			picked += 1
+		end
+		local _, row = self:box(if on then C.card else C.bg, { height = 50, shadow = if on then 3 else 0, radius = 8, face = "TextButton", LayoutOrder = index, Parent = scroll })
+		self:checkbox(on, UDim2.fromOffset(12, 15)).Parent = row
+		self:label(finding.fix.label .. (if finding.fix.risky then "   (check first)" else ""), 13, C.ink, Font.Bold, {
+			Position = UDim2.fromOffset(42, 7), Size = UDim2.new(1, -54, 0, 18), AutomaticSize = Enum.AutomaticSize.None,
+			TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+		})
+		self:label(finding.path, 11, C.muted, Font.Mono, {
+			Position = UDim2.fromOffset(42, 27), Size = UDim2.new(1, -54, 0, 14), AutomaticSize = Enum.AutomaticSize.None,
+			TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+		})
+		row.Activated:Connect(function()
+			actions.togglePick(finding)
+		end)
+	end
+
+	self:label("Property changes undo with Ctrl+Z. Script changes undo in the script editor. The Log tab records every choice.",
+		12, C.muted, Font.Regular, { LayoutOrder = 4, Parent = card })
+	local row = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 5, Parent = card })
+	self:button("Not now", C.card, actions.closeOverlay, { width = UDim.new(0.5, -6), height = 40, textSize = 14, Parent = row })
+	self:button(if picked > 0 then string.format("Apply %d selected", picked) else "Pick a change", if picked > 0 then C.yellow else C.bg, function()
+		if picked > 0 then
+			actions.applyPicked()
+		end
+	end, { width = UDim.new(0.5, -6), height = 40, textSize = 14, shadow = if picked > 0 then 3 else 0, Position = UDim2.new(0.5, 6, 0, 0), Parent = row })
+end
+
+function View:renderCopy()
+	local C, app = self.C, self.app
+	self.overlay.Visible = true
+	local card = self:dimmer()
+	self:label("Copy the log", 18, C.ink, Font.Display, { LayoutOrder = 1, Parent = card })
+	self:label("Click the text, press Ctrl+A, then Ctrl+C.", 13, C.body, Font.Regular, { LayoutOrder = 2, Parent = card })
+	local scroll = make("ScrollingFrame", {
+		BackgroundColor3 = C.bg, BorderSizePixel = 0, LayoutOrder = 3, Parent = card, Size = UDim2.new(1, 0, 0, 260),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6, ScrollBarImageColor3 = C.ink,
+	}, { corner(8), border(C.ink), padding(10) })
+	local text = app.log:text()
+	local box = make("TextBox", {
+		BackgroundTransparency = 1, ClearTextOnFocus = false, TextEditable = false, MultiLine = true,
+		Text = if text == "" then "(empty)" else text, TextSize = 12, FontFace = Font.Mono, TextColor3 = C.body,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = scroll,
+	})
+	box.Focused:Connect(function()
+		box.SelectionStart = 1
+		box.CursorPosition = #box.Text + 1
+	end)
+	self:button("Close", C.card, app.actions.closeOverlay, { width = UDim.new(1, 0), height = 38, textSize = 14, LayoutOrder = 4, Parent = card })
+end
+
+return View
+]]></ProtectedString></Properties></Item></Item></roblox>
